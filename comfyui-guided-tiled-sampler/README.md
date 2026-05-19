@@ -41,6 +41,7 @@ Recommended人物 8K defaults:
 - `分块宽度` / `分块高度`: `1024 - 1536`
 - `重叠像素`: `192 - 256`
 - `上下文像素`: `384 - 512`
+- `采样缓冲像素`: `96 - 160`
 - `重绘轮数`: `1`
 - `预览频率`: `每个分块`
 - `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质
@@ -48,10 +49,20 @@ Recommended人物 8K defaults:
 - `递进强度衰减`: `0.85`
 - `色彩稳定强度`: `0`
 - `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.
+- `参数预设`: `人物稳定` for人物, `背景增强` for scenery/materials.
+- `人物安全模式`: `启用`
+- `主体重绘上限`: `0.12 - 0.16` with a subject mask.
+- `接缝修复`: `禁用` by default; use `启用` with `接缝修复强度 = 0.04 - 0.08` if seams remain.
 
 The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
+
+`采样缓冲像素` separates the sampled area from the written area. Each tile now samples `write core + sample halo` inside the larger context crop, but only writes the original center tile back to the full latent canvas. This reduces hard mask edges while keeping context read-only.
+
+`主体保护遮罩` now does two jobs. It still softens the noise mask inside protected areas, and it also enables adaptive tile denoise: subject-heavy tiles are capped by `主体重绘上限`, while low-subject tiles may use `背景重绘倍率` to add more background texture. `人物安全模式` applies extra runtime caps for人物 presets or when a subject mask is connected.
+
+`接缝修复` runs only on the final stage. It creates a seam mask along tile boundaries and performs one low-denoise masked redraw pass there, then writes only the seam areas back with the normal feather accumulation. Keep it off unless visible seams remain.
 
 `递进放大模式` creates intermediate canvases before the final size. For example, a 1024px source targeting 4K with `平衡1024阶梯` runs approximately `2048 -> 3072 -> 4096`. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
 

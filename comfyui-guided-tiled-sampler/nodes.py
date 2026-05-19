@@ -21,10 +21,19 @@ REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
+REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
+ENABLE_CHOICES = ["启用", "禁用"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
     "8K": 8192,
+}
+
+ENABLE_MAP = {
+    "启用": True,
+    "禁用": False,
+    True: True,
+    False: False,
 }
 
 ADD_NOISE_MAP = {
@@ -230,6 +239,106 @@ def _effective_sampler_steps(steps: int, start_step: Optional[int], last_step: O
     return max(1, end - start)
 
 
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _enabled(value) -> bool:
+    return bool(ENABLE_MAP.get(value, value))
+
+
+def _seed_for_stage(seed: int, stage_index: int, offset: int = 0) -> int:
+    return (int(seed) + int(stage_index) * 100003 + int(offset)) & 0xffffffffffffffff
+
+
+def _apply_redraw_policy(
+    preset: str,
+    safety_enabled: bool,
+    has_subject_mask: bool,
+    cfg: float,
+    denoise: float,
+    detail: float,
+    sample_halo: int,
+    subject_cap: float,
+    background_multiplier: float,
+    subject_threshold: float,
+    reference_hold: float,
+    seam_enabled: bool,
+    seam_denoise: float,
+    seam_width: int,
+) -> Tuple[float, float, float, int, float, float, float, float, bool, float, int]:
+    preset = preset if preset in REDRAW_PRESET_CHOICES else "自定义"
+    cfg = float(cfg)
+    denoise = _clamp_float(denoise, 0.01, 1.0)
+    detail = _clamp_float(detail, 0.0, 0.25)
+    sample_halo = max(0, int(sample_halo))
+    subject_cap = _clamp_float(subject_cap, 0.01, 1.0)
+    background_multiplier = _clamp_float(background_multiplier, 0.1, 3.0)
+    subject_threshold = _clamp_float(subject_threshold, 0.0, 1.0)
+    reference_hold = _clamp_float(reference_hold, 0.0, 0.8)
+    seam_denoise = _clamp_float(seam_denoise, 0.01, 0.5)
+    seam_width = max(0, int(seam_width))
+
+    if preset == "人物稳定":
+        cfg = min(cfg, 4.8)
+        denoise = min(denoise, 0.18)
+        detail = min(detail, 0.01)
+        sample_halo = max(sample_halo, 96)
+        subject_cap = min(subject_cap, 0.14)
+        background_multiplier = min(max(background_multiplier, 1.0), 1.25)
+        subject_threshold = max(subject_threshold, 0.12)
+        reference_hold = _clamp_float(reference_hold, 0.04, 0.08)
+    elif preset == "人物细节":
+        cfg = min(cfg, 5.0)
+        denoise = min(denoise, 0.22)
+        detail = min(detail, 0.015)
+        sample_halo = max(sample_halo, 96)
+        subject_cap = min(subject_cap, 0.16)
+        background_multiplier = min(max(background_multiplier, 1.1), 1.35)
+        subject_threshold = max(subject_threshold, 0.12)
+        reference_hold = _clamp_float(reference_hold, 0.03, 0.08)
+    elif preset == "背景增强":
+        sample_halo = max(sample_halo, 128)
+        background_multiplier = max(background_multiplier, 1.35)
+        seam_width = max(seam_width, 96)
+    elif preset == "建筑线条":
+        cfg = min(cfg, 6.0)
+        sample_halo = max(sample_halo, 128)
+        background_multiplier = max(background_multiplier, 1.2)
+        detail = min(detail, 0.02)
+        seam_width = max(seam_width, 128)
+    elif preset == "极限8K保守":
+        cfg = min(cfg, 4.2)
+        denoise = min(denoise, 0.14)
+        detail = 0.0
+        sample_halo = max(sample_halo, 128)
+        subject_cap = min(subject_cap, 0.12)
+        background_multiplier = min(background_multiplier, 1.1)
+        subject_threshold = max(subject_threshold, 0.10)
+        reference_hold = _clamp_float(reference_hold, 0.05, 0.10)
+        seam_denoise = min(seam_denoise, 0.06)
+
+    if safety_enabled and (preset in ("人物稳定", "人物细节", "极限8K保守") or has_subject_mask):
+        cfg = min(cfg, 5.2)
+        detail = min(detail, 0.02)
+        subject_cap = min(subject_cap, 0.16)
+        background_multiplier = min(background_multiplier, 1.4)
+
+    return (
+        cfg,
+        denoise,
+        detail,
+        sample_halo,
+        subject_cap,
+        background_multiplier,
+        subject_threshold,
+        reference_hold,
+        seam_enabled,
+        seam_denoise,
+        seam_width,
+    )
+
+
 def _ordered_tiles(tiles: List[Tuple[int, int, int, int]], height: int, width: int, mode: str) -> List[Tuple[int, int, int, int]]:
     if mode == "中心向外":
         cy = height / 2.0
@@ -270,6 +379,35 @@ def _tile_grid(height: int, width: int, tile_h: int, tile_w: int, overlap: int) 
     ys = _tile_positions(height, tile_h, overlap)
     xs = _tile_positions(width, tile_w, overlap)
     return [(y, min(y + tile_h, height), x, min(x + tile_w, width)) for y in ys for x in xs]
+
+
+def _seam_mask_from_tiles(
+    tiles: Sequence[Tuple[int, int, int, int]],
+    height: int,
+    width: int,
+    seam: int,
+    device,
+    dtype,
+) -> Optional[torch.Tensor]:
+    seam = max(0, int(seam))
+    if seam <= 0:
+        return None
+    mask = torch.zeros((1, 1, height, width), device=device, dtype=dtype)
+    half = max(1, seam // 2)
+    for y0, y1, x0, x1 in tiles:
+        if y0 > 0:
+            a = max(0, y0 - half)
+            b = min(height, y0 + half)
+            mask[:, :, a:b, x0:x1] = 1.0
+        if x0 > 0:
+            a = max(0, x0 - half)
+            b = min(width, x0 + half)
+            mask[:, :, y0:y1, a:b] = 1.0
+    if mask.max().item() <= 0:
+        return None
+    if seam > 2:
+        mask = torch.nn.functional.avg_pool2d(mask, kernel_size=3, stride=1, padding=1).clamp(0.0, 1.0)
+    return mask
 
 
 def _edge_ramp(n: int, mode: str, device, dtype) -> torch.Tensor:
@@ -853,6 +991,8 @@ class L13ContextMaskedRedraw8K:
     tile_orders = TILE_ORDER_CHOICES
     target_sizes = TARGET_SIZE_CHOICES
     progressive_modes = PROGRESSIVE_MODE_CHOICES
+    redraw_presets = REDRAW_PRESET_CHOICES
+    enable_modes = ENABLE_CHOICES
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
 
     @classmethod
@@ -869,6 +1009,8 @@ class L13ContextMaskedRedraw8K:
                 "CFG引导": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段，通常 3.5-5.5。"}),
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "局部重绘使用的采样器。建议先用 dpmpp_2m_sde_gpu / dpmpp_3m_sde_gpu / euler。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "局部重绘使用的调度器。建议和第一段一致或使用 karras。"}),
+                "参数预设": (cls.redraw_presets, {"tooltip": "运行时安全预设。自定义完全按参数跑；人物稳定/人物细节会限制高 CFG、高重绘和高扰动；背景/建筑会更偏向纹理和线条。"}),
+                "人物安全模式": (cls.enable_modes, {"tooltip": "启用后，在人物预设或连接主体遮罩时自动限制主体 tile 的重绘强度和细节扰动，降低重复主体、换脸和发灰风险。"}),
                 "目标规格": (cls.target_sizes, {"tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
@@ -880,6 +1022,7 @@ class L13ContextMaskedRedraw8K:
                 "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
                 "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
                 "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "采样缓冲像素": ("INT", {"default": 96, "min": 0, "max": 2048, "step": 8, "tooltip": "在中心写回区外额外允许采样的一圈 halo。halo 会参与 denoise 但不会写回全图，用来减少 tile 边缘被 mask 截断。"}),
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
@@ -888,6 +1031,12 @@ class L13ContextMaskedRedraw8K:
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
+                "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "当主体遮罩在 tile 中占比较高时，实际重绘强度不会超过这个值。用于防止人物主体被二次生成。"}),
+                "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 会把重绘强度乘以该倍率，让背景比主体更容易长细节。"}),
+                "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时，当前 tile 按主体 tile 处理并应用主体重绘上限。"}),
+                "接缝修复": (["禁用", "启用"], {"tooltip": "启用后在最终阶段额外跑一轮低强度 seam pass，只处理 tile 边界附近，帮助统一接缝纹理。"}),
+                "接缝修复强度": ("FLOAT", {"default": 0.06, "min": 0.01, "max": 0.5, "step": 0.01, "round": 0.001, "tooltip": "接缝修复 pass 的 denoise。它只负责统一边界，不负责新增主体细节，建议 0.04-0.08。"}),
+                "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
@@ -965,6 +1114,8 @@ class L13ContextMaskedRedraw8K:
         CFG引导,
         采样器,
         调度器,
+        参数预设,
+        人物安全模式,
         目标规格,
         目标宽度,
         目标高度,
@@ -976,6 +1127,7 @@ class L13ContextMaskedRedraw8K:
         分块高度,
         重叠像素,
         上下文像素,
+        采样缓冲像素,
         融合方式,
         图像缩放算法,
         重绘轮数,
@@ -983,6 +1135,12 @@ class L13ContextMaskedRedraw8K:
         最大分块数,
         色彩稳定强度=0.0,
         参考保留强度=0.06,
+        主体重绘上限=0.14,
+        背景重绘倍率=1.25,
+        主体判断阈值=0.18,
+        接缝修复="禁用",
+        接缝修复强度=0.06,
+        接缝宽度=96,
         预览频率="每个分块",
         加噪="启用",
         起始步=None,
@@ -998,6 +1156,36 @@ class L13ContextMaskedRedraw8K:
         force_full_denoise = leftover_noise == "disable"
         scale = _vae_scale(VAE)
         pass_count = max(1, int(重绘轮数))
+        safety_enabled = _enabled(人物安全模式)
+        seam_enabled = _enabled(接缝修复)
+        (
+            CFG引导,
+            重绘强度,
+            细节扰动,
+            采样缓冲像素,
+            主体重绘上限,
+            背景重绘倍率,
+            主体判断阈值,
+            参考保留强度,
+            seam_enabled,
+            接缝修复强度,
+            接缝宽度,
+        ) = _apply_redraw_policy(
+            参数预设,
+            safety_enabled,
+            主体保护遮罩 is not None,
+            CFG引导,
+            重绘强度,
+            细节扰动,
+            采样缓冲像素,
+            主体重绘上限,
+            背景重绘倍率,
+            主体判断阈值,
+            参考保留强度,
+            seam_enabled,
+            接缝修复强度,
+            接缝宽度,
+        )
         stage_pixels = _progressive_stage_pixels(
             参考图像,
             目标规格,
@@ -1014,10 +1202,14 @@ class L13ContextMaskedRedraw8K:
             tile_w = max(1, min(_round_to_multiple_floor(分块宽度, scale) // scale, width))
             overlap = max(0, min(_round_to_multiple_floor(重叠像素, scale) // scale, tile_h - 1, tile_w - 1))
             context = max(0, min(_round_to_multiple_floor(上下文像素, scale) // scale, height - 1, width - 1))
+            sample_halo = 0
+            if int(采样缓冲像素) > 0:
+                sample_halo = max(0, min(_round_to_multiple_floor(采样缓冲像素, scale) // scale, height - 1, width - 1))
             tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
-            stage_plans.append((stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, tiles))
+            stage_plans.append((stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles))
 
-        total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans)
+        seam_runs = len(stage_plans[-1][-1]) if seam_enabled and 接缝宽度 > 0 and len(stage_plans[-1][-1]) > 1 else 0
+        total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans) + seam_runs
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
             raise RuntimeError(f"L13 局部重绘预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
 
@@ -1028,7 +1220,7 @@ class L13ContextMaskedRedraw8K:
         stage_count = len(stage_plans)
         decay = float(递进强度衰减)
 
-        for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, tiles) in enumerate(stage_plans):
+        for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
             base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
             canvas = base.clone()
@@ -1039,10 +1231,10 @@ class L13ContextMaskedRedraw8K:
             if disable_noise:
                 global_noise = torch.zeros(canvas.size(), dtype=canvas.dtype, layout=canvas.layout, device="cpu")
             else:
-                global_noise = comfy.sample.prepare_noise(canvas, int(噪声种子), None)
+                global_noise = comfy.sample.prepare_noise(canvas, _seed_for_stage(噪声种子, stage_index), None)
             detail_noise = None
             if float(细节扰动) > 0:
-                detail_seed = (int(噪声种子) + 0x9E3779B97F4A7C15) & 0xffffffffffffffff
+                detail_seed = _seed_for_stage(噪声种子, stage_index, 0x9E3779B97F4A7C15)
                 detail_noise = _normalize_detail_noise(comfy.sample.prepare_noise(canvas, detail_seed, None))
 
             protect_mask = None
@@ -1055,22 +1247,39 @@ class L13ContextMaskedRedraw8K:
                 weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
 
                 for tile_index, (y0, y1, x0, x1) in enumerate(tiles):
-                    cy0 = max(0, y0 - context)
-                    cy1 = min(height, y1 + context)
-                    cx0 = max(0, x0 - context)
-                    cx1 = min(width, x1 + context)
+                    sy0 = max(0, y0 - sample_halo)
+                    sy1 = min(height, y1 + sample_halo)
+                    sx0 = max(0, x0 - sample_halo)
+                    sx1 = min(width, x1 + sample_halo)
+                    cy0 = max(0, sy0 - context)
+                    cy1 = min(height, sy1 + context)
+                    cx0 = max(0, sx0 - context)
+                    cx1 = min(width, sx1 + context)
                     iy0 = y0 - cy0
                     iy1 = iy0 + (y1 - y0)
                     ix0 = x0 - cx0
                     ix1 = ix0 + (x1 - x0)
+                    sy0i = sy0 - cy0
+                    sy1i = sy1 - cy0
+                    sx0i = sx0 - cx0
+                    sx1i = sx1 - cx0
 
                     context_latent = canvas[:, :, cy0:cy1, cx0:cx1].clone()
                     context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
                     noise_mask = torch.zeros((canvas.shape[0], 1, cy1 - cy0, cx1 - cx0), device=canvas.device, dtype=canvas.dtype)
-                    noise_mask[:, :, iy0:iy1, ix0:ix1] = 1.0
-                    if protect_mask is not None and 主体保护强度 > 0:
-                        local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
-                        noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                    noise_mask[:, :, sy0i:sy1i, sx0i:sx1i] = 1.0
+                    effective_denoise = stage_denoise
+
+                    if protect_mask is not None:
+                        subject_ratio = float(protect_mask[:, :, y0:y1, x0:x1].mean().item())
+                        if subject_ratio >= float(主体判断阈值):
+                            effective_denoise = min(effective_denoise, float(主体重绘上限))
+                        else:
+                            effective_denoise = min(1.0, effective_denoise * float(背景重绘倍率))
+                        if 主体保护强度 > 0:
+                            local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
+                            noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+
                     if detail_noise is not None:
                         local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
                         context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
@@ -1088,7 +1297,7 @@ class L13ContextMaskedRedraw8K:
                         CFG引导,
                         采样器,
                         调度器,
-                        stage_denoise,
+                        effective_denoise,
                         True,
                         disable_noise=disable_noise,
                         start_step=起始步,
@@ -1113,6 +1322,81 @@ class L13ContextMaskedRedraw8K:
                     progress.capture_preview(canvas)
                     progress.force_preview()
 
+            if seam_enabled and stage_index == stage_count - 1 and len(tiles) > 1:
+                seam_latent = 0
+                if int(接缝宽度) > 0:
+                    seam_latent = max(0, _round_to_multiple_floor(接缝宽度, scale) // scale)
+                seam_mask = _seam_mask_from_tiles(tiles, height, width, seam_latent, canvas.device, canvas.dtype)
+                if seam_mask is not None:
+                    seam_accum = torch.zeros_like(canvas)
+                    seam_weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
+                    for tile_index, (y0, y1, x0, x1) in enumerate(tiles):
+                        sy0 = max(0, y0 - sample_halo)
+                        sy1 = min(height, y1 + sample_halo)
+                        sx0 = max(0, x0 - sample_halo)
+                        sx1 = min(width, x1 + sample_halo)
+                        cy0 = max(0, sy0 - context)
+                        cy1 = min(height, sy1 + context)
+                        cx0 = max(0, sx0 - context)
+                        cx1 = min(width, sx1 + context)
+                        iy0 = y0 - cy0
+                        iy1 = iy0 + (y1 - y0)
+                        ix0 = x0 - cx0
+                        ix1 = ix0 + (x1 - x0)
+
+                        context_latent = canvas[:, :, cy0:cy1, cx0:cx1].clone()
+                        context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
+                        noise_mask = seam_mask[:, :, cy0:cy1, cx0:cx1].repeat(canvas.shape[0], 1, 1, 1)
+                        if protect_mask is not None and 主体保护强度 > 0:
+                            local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
+                            noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                        if noise_mask.max().item() <= 0:
+                            progress.start_tile(sampler_steps)
+                            progress.finish_tile(sampler_steps)
+                            continue
+
+                        progress.start_tile(sampler_steps)
+                        out_context = self._sample_tile(
+                            模型,
+                            正向条件,
+                            负向条件,
+                            context_latent,
+                            context_noise,
+                            noise_mask,
+                            int(噪声种子),
+                            总步数,
+                            CFG引导,
+                            采样器,
+                            调度器,
+                            接缝修复强度,
+                            True,
+                            disable_noise=disable_noise,
+                            start_step=起始步,
+                            last_step=结束步,
+                            force_full_denoise=force_full_denoise,
+                            callback=progress.tile_callback(),
+                        )
+                        if 预览频率 == "每个分块":
+                            progress.capture_preview(out_context)
+                        progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每个分块"))
+                        out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
+                        base_tile = base[:, :, y0:y1, x0:x1]
+                        compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
+                        reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                        out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
+                        seam_weight = seam_mask[:, :, y0:y1, x0:x1].repeat(canvas.shape[0], 1, 1, 1)
+                        weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
+                        weight = weight * seam_weight
+                        seam_accum[:, :, y0:y1, x0:x1] += out_tile * weight
+                        seam_weights[:, :, y0:y1, x0:x1] += weight
+
+                    eps = torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6
+                    updated = seam_accum / seam_weights.clamp_min(eps)
+                    canvas = torch.where((seam_weights > eps).expand_as(canvas), updated, canvas)
+                    if 预览频率 == "每轮":
+                        progress.capture_preview(canvas)
+                        progress.force_preview()
+
             if stage_index < stage_count - 1:
                 current_pixels = _vae_decode_latent(VAE, canvas)
 
@@ -1130,6 +1414,8 @@ class L13ContextMaskedRedraw8K:
         CFG引导,
         采样器,
         调度器,
+        参数预设,
+        人物安全模式,
         目标规格,
         目标宽度,
         目标高度,
@@ -1141,6 +1427,7 @@ class L13ContextMaskedRedraw8K:
         分块高度,
         重叠像素,
         上下文像素,
+        采样缓冲像素,
         融合方式,
         图像缩放算法,
         重绘轮数,
@@ -1148,6 +1435,12 @@ class L13ContextMaskedRedraw8K:
         最大分块数,
         色彩稳定强度,
         参考保留强度,
+        主体重绘上限,
+        背景重绘倍率,
+        主体判断阈值,
+        接缝修复,
+        接缝修复强度,
+        接缝宽度,
         预览频率="每个分块",
         主体保护遮罩=None,
         主体保护强度=0.55,
@@ -1163,6 +1456,8 @@ class L13ContextMaskedRedraw8K:
             CFG引导,
             采样器,
             调度器,
+            参数预设,
+            人物安全模式,
             目标规格,
             目标宽度,
             目标高度,
@@ -1174,6 +1469,7 @@ class L13ContextMaskedRedraw8K:
             分块高度,
             重叠像素,
             上下文像素,
+            采样缓冲像素,
             融合方式,
             图像缩放算法,
             重绘轮数,
@@ -1181,6 +1477,12 @@ class L13ContextMaskedRedraw8K:
             最大分块数,
             色彩稳定强度,
             参考保留强度,
+            主体重绘上限,
+            背景重绘倍率,
+            主体判断阈值,
+            接缝修复,
+            接缝修复强度,
+            接缝宽度,
             预览频率=预览频率,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
@@ -1206,6 +1508,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "局部重绘使用的调度器。分段采样时各段应保持一致。"}),
                 "正向条件": ("CONDITIONING", {"tooltip": "第二段使用的正向提示词。可以和第一段相同，但不要用过高 CFG。"}),
                 "负向条件": ("CONDITIONING", {"tooltip": "第二段使用的负向提示词。建议加入 duplicate person、collage、split image 等负向词。"}),
+                "参数预设": (cls.redraw_presets, {"tooltip": "运行时安全预设。自定义完全按参数跑；人物稳定/人物细节会限制高 CFG、高重绘和高扰动；背景/建筑会更偏向纹理和线条。"}),
+                "人物安全模式": (cls.enable_modes, {"tooltip": "启用后，在人物预设或连接主体遮罩时自动限制主体 tile 的重绘强度和细节扰动，降低重复主体、换脸和发灰风险。"}),
                 "起始步": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "本段从完整采样时间线的第几步开始。比如先构图 3 步后，这里填 3。"}),
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
@@ -1220,6 +1524,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
                 "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
                 "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "采样缓冲像素": ("INT", {"default": 96, "min": 0, "max": 2048, "step": 8, "tooltip": "在中心写回区外额外允许采样的一圈 halo。halo 会参与 denoise 但不会写回全图，用来减少 tile 边缘被 mask 截断。"}),
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
@@ -1228,6 +1533,12 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
+                "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "当主体遮罩在 tile 中占比较高时，实际重绘强度不会超过这个值。用于防止人物主体被二次生成。"}),
+                "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 会把重绘强度乘以该倍率，让背景比主体更容易长细节。"}),
+                "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时，当前 tile 按主体 tile 处理并应用主体重绘上限。"}),
+                "接缝修复": (["禁用", "启用"], {"tooltip": "启用后在最终阶段额外跑一轮低强度 seam pass，只处理 tile 边界附近，帮助统一接缝纹理。"}),
+                "接缝修复强度": ("FLOAT", {"default": 0.06, "min": 0.01, "max": 0.5, "step": 0.01, "round": 0.001, "tooltip": "接缝修复 pass 的 denoise。它只负责统一边界，不负责新增主体细节，建议 0.04-0.08。"}),
+                "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
@@ -1250,6 +1561,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         调度器,
         正向条件,
         负向条件,
+        参数预设,
+        人物安全模式,
         起始步,
         结束步,
         保留剩余噪声,
@@ -1264,6 +1577,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         分块高度,
         重叠像素,
         上下文像素,
+        采样缓冲像素,
         融合方式,
         图像缩放算法,
         重绘轮数,
@@ -1271,6 +1585,12 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         最大分块数,
         色彩稳定强度,
         参考保留强度,
+        主体重绘上限,
+        背景重绘倍率,
+        主体判断阈值,
+        接缝修复,
+        接缝修复强度,
+        接缝宽度,
         预览频率="每个分块",
         主体保护遮罩=None,
         主体保护强度=0.55,
@@ -1286,6 +1606,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             CFG引导,
             采样器,
             调度器,
+            参数预设,
+            人物安全模式,
             目标规格,
             目标宽度,
             目标高度,
@@ -1297,6 +1619,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             分块高度,
             重叠像素,
             上下文像素,
+            采样缓冲像素,
             融合方式,
             图像缩放算法,
             重绘轮数,
@@ -1304,6 +1627,12 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             最大分块数,
             色彩稳定强度,
             参考保留强度,
+            主体重绘上限,
+            背景重绘倍率,
+            主体判断阈值,
+            接缝修复,
+            接缝修复强度,
+            接缝宽度,
             预览频率=预览频率,
             加噪=加噪,
             起始步=起始步,

@@ -48,7 +48,7 @@ Recommended人物 8K defaults:
 - `重绘轮数`: `1`
 - `预览频率`: `每个分块`
 - `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质
-- `递进放大模式`: `平衡1024阶梯` for人物 4K/8K; use `快速2倍` for背景 when speed matters.
+- `递进放大模式`: `快速2倍` by default; use `平衡1024阶梯` or `稳定1.5倍` if人物一致性 is more important than speed.
 - `递进强度衰减`: `0.85`
 - `色彩稳定强度`: `0`
 - `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.

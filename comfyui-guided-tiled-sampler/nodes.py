@@ -20,6 +20,7 @@ TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
+PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
@@ -157,6 +158,78 @@ def _vae_encode_pixels(vae, pixels: torch.Tensor) -> torch.Tensor:
     return vae.encode(pixels)
 
 
+def _vae_decode_latent(vae, samples: torch.Tensor) -> torch.Tensor:
+    pixel_h = int(samples.shape[-2]) * _vae_scale(vae)
+    pixel_w = int(samples.shape[-1]) * _vae_scale(vae)
+    if max(pixel_h, pixel_w) >= 2048 and hasattr(vae, "decode_tiled"):
+        try:
+            return vae.decode_tiled(samples, tile_x=1024, tile_y=1024, overlap=128)
+        except TypeError:
+            return vae.decode_tiled(samples)
+    return vae.decode(samples)
+
+
+def _pixels_from_long_edge(width: int, height: int, long_edge: int, scale: int) -> Tuple[int, int]:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    long_edge = min(MAX_RESOLUTION, max(scale, int(long_edge)))
+    if width >= height:
+        out_w = _round_to_multiple_nearest(long_edge, scale)
+        out_h = _round_to_multiple_nearest(long_edge * height / width, scale)
+    else:
+        out_w = _round_to_multiple_nearest(long_edge * width / height, scale)
+        out_h = _round_to_multiple_nearest(long_edge, scale)
+    return min(out_w, MAX_RESOLUTION), min(out_h, MAX_RESOLUTION)
+
+
+def _progressive_stage_pixels(
+    reference_image: torch.Tensor,
+    target_size: str,
+    target_width: int,
+    target_height: int,
+    scale: int,
+    mode: str,
+) -> List[Tuple[int, int]]:
+    final_w, final_h = _target_pixels_from_image_ratio(reference_image, target_size, target_width, target_height, scale)
+    if mode == "关闭":
+        return [(final_w, final_h)]
+
+    src_h = max(1, int(reference_image.shape[1]))
+    src_w = max(1, int(reference_image.shape[2]))
+    src_long = max(src_w, src_h)
+    final_long = max(final_w, final_h)
+    if final_long <= src_long:
+        return [(final_w, final_h)]
+
+    stages: List[Tuple[int, int]] = []
+    current = float(src_long)
+    while current < final_long:
+        if mode == "快速2倍":
+            next_long = current * 2.0
+        elif mode == "稳定1.5倍":
+            next_long = current * 1.5
+        else:
+            next_long = current + 1024.0
+
+        next_long = min(float(final_long), max(next_long, current + scale))
+        stage_w, stage_h = _pixels_from_long_edge(final_w, final_h, int(round(next_long)), scale)
+        if stages and stages[-1] == (stage_w, stage_h):
+            break
+        stages.append((stage_w, stage_h))
+        current = max(float(stage_w), float(stage_h))
+
+    if not stages or stages[-1] != (final_w, final_h):
+        stages.append((final_w, final_h))
+    return stages
+
+
+def _effective_sampler_steps(steps: int, start_step: Optional[int], last_step: Optional[int]) -> int:
+    steps = max(1, int(steps))
+    start = 0 if start_step is None else max(0, min(int(start_step), steps))
+    end = steps if last_step is None else max(0, min(int(last_step), steps))
+    return max(1, end - start)
+
+
 def _ordered_tiles(tiles: List[Tuple[int, int, int, int]], height: int, width: int, mode: str) -> List[Tuple[int, int, int, int]]:
     if mode == "中心向外":
         cy = height / 2.0
@@ -256,9 +329,11 @@ def _normalize_detail_noise(noise: torch.Tensor) -> torch.Tensor:
 
 
 class _CanvasProgress:
-    def __init__(self, model, total: int, preview_mode: str):
-        self.total = max(1, int(total))
-        self.current = 0
+    def __init__(self, model, total_steps: int, preview_mode: str):
+        self.total = max(1, int(total_steps))
+        self.completed = 0
+        self.tile_start = 0
+        self.tile_steps = 1
         self.preview_mode = preview_mode
         self.pbar = comfy.utils.ProgressBar(self.total)
         self.previewer = None
@@ -269,27 +344,38 @@ class _CanvasProgress:
             except Exception as exc:
                 logging.warning("L13 KSampler-style previewer could not be initialized: %s", exc)
 
+    def start_tile(self, expected_steps: int):
+        self.tile_start = self.completed
+        self.tile_steps = max(1, int(expected_steps))
+
     def tile_callback(self):
-        if self.previewer is None:
-            return None
         preview_format = "JPEG"
 
         def callback(step, x0, x, total_steps):
-            try:
-                self.last_preview = self.previewer.decode_latent_to_preview_image(preview_format, x0)
-            except Exception as exc:
-                logging.warning("L13 KSampler-style preview failed and will be disabled: %s", exc)
-                self.previewer = None
-                self.last_preview = None
+            preview = None
+            if self.previewer is not None:
+                try:
+                    self.last_preview = self.previewer.decode_latent_to_preview_image(preview_format, x0)
+                except Exception as exc:
+                    logging.warning("L13 KSampler-style preview failed and will be disabled: %s", exc)
+                    self.previewer = None
+                    self.last_preview = None
+                if self.preview_mode == "每个分块":
+                    preview = self.last_preview
+            current = min(self.total, self.tile_start + max(1, int(step) + 1))
+            self.pbar.update_absolute(current, self.total, preview)
 
         return callback
 
-    def update(self, force_preview: bool = False):
-        self.current = min(self.current + 1, self.total)
-        preview = None
-        if self.preview_mode == "每个分块" or force_preview:
-            preview = self.last_preview
-        self.pbar.update_absolute(self.current, self.total, preview)
+    def finish_tile(self, actual_steps: Optional[int] = None, force_preview: bool = False):
+        steps = self.tile_steps if actual_steps is None else max(1, int(actual_steps))
+        self.completed = min(self.total, self.tile_start + steps)
+        preview = self.last_preview if force_preview and self.preview_mode != "关闭" else None
+        self.pbar.update_absolute(self.completed, self.total, preview)
+
+    def force_preview(self):
+        if self.preview_mode != "关闭" and self.last_preview is not None:
+            self.pbar.update_absolute(self.completed, self.total, self.last_preview)
 
 
 def _crop_mask(mask: torch.Tensor, y0: int, y1: int, x0: int, x1: int) -> torch.Tensor:
@@ -735,6 +821,7 @@ class L13ContextMaskedRedraw8K:
     blend_modes = BLEND_CHOICES
     tile_orders = TILE_ORDER_CHOICES
     target_sizes = TARGET_SIZE_CHOICES
+    progressive_modes = PROGRESSIVE_MODE_CHOICES
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
 
     @classmethod
@@ -754,6 +841,8 @@ class L13ContextMaskedRedraw8K:
                 "目标规格": (cls.target_sizes, {"tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "递进放大模式": (cls.progressive_modes, {"tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
+                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时重绘强度的乘数。0.85 表示越接近最终尺寸越保守；关闭递进时忽略。"}),
                 "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。人物 8K 建议 0.12-0.22，背景可到 0.30-0.35。"}),
                 "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
                 "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
@@ -779,12 +868,15 @@ class L13ContextMaskedRedraw8K:
     CATEGORY = "sampling/l13_redraw"
     DESCRIPTION = "Reference-anchored context-aware masked img2img redraw pass for 4K/8K latent canvases."
 
+    def _build_canvas_from_pixels(self, vae, pixels, target_width, target_height, image_upscale):
+        pixels = _scale_pixels(pixels, target_width, target_height, image_upscale)
+        samples = _vae_encode_pixels(vae, pixels)
+        return samples
+
     def _build_canvas(self, vae, reference_image, target_size, target_width, target_height, image_upscale):
         scale = _vae_scale(vae)
         target_width, target_height = _target_pixels_from_image_ratio(reference_image, target_size, target_width, target_height, scale)
-        pixels = _scale_pixels(reference_image, target_width, target_height, image_upscale)
-        samples = _vae_encode_pixels(vae, pixels)
-        return samples
+        return self._build_canvas_from_pixels(vae, reference_image, target_width, target_height, image_upscale)
 
     def _sample_tile(
         self,
@@ -843,6 +935,8 @@ class L13ContextMaskedRedraw8K:
         目标规格,
         目标宽度,
         目标高度,
+        递进放大模式,
+        递进强度衰减,
         重绘强度,
         细节扰动,
         分块宽度,
@@ -867,90 +961,118 @@ class L13ContextMaskedRedraw8K:
         leftover_noise = LEFTOVER_NOISE_MAP[保留剩余噪声]
         disable_noise = add_noise == "disable"
         force_full_denoise = leftover_noise == "disable"
-        base = self._build_canvas(VAE, 参考图像, 目标规格, 目标宽度, 目标高度, 图像缩放算法)
-        base = comfy.sample.fix_empty_latent_channels(模型, base)
-        canvas = base.clone()
-
-        _, _, height, width = canvas.shape
         scale = _vae_scale(VAE)
-        tile_h = max(1, min(_round_to_multiple_floor(分块高度, scale) // scale, height))
-        tile_w = max(1, min(_round_to_multiple_floor(分块宽度, scale) // scale, width))
-        overlap = max(0, min(_round_to_multiple_floor(重叠像素, scale) // scale, tile_h - 1, tile_w - 1))
-        context = max(0, _round_to_multiple_floor(上下文像素, scale) // scale)
-        tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
+        pass_count = max(1, int(重绘轮数))
+        stage_pixels = _progressive_stage_pixels(
+            参考图像,
+            目标规格,
+            目标宽度,
+            目标高度,
+            scale,
+            递进放大模式,
+        )
+        stage_plans = []
+        for stage_width, stage_height in stage_pixels:
+            height = max(1, int(stage_height) // scale)
+            width = max(1, int(stage_width) // scale)
+            tile_h = max(1, min(_round_to_multiple_floor(分块高度, scale) // scale, height))
+            tile_w = max(1, min(_round_to_multiple_floor(分块宽度, scale) // scale, width))
+            overlap = max(0, min(_round_to_multiple_floor(重叠像素, scale) // scale, tile_h - 1, tile_w - 1))
+            context = max(0, min(_round_to_multiple_floor(上下文像素, scale) // scale, height - 1, width - 1))
+            tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
+            stage_plans.append((stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, tiles))
 
-        total_tile_runs = len(tiles) * max(1, int(重绘轮数))
+        total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans)
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
             raise RuntimeError(f"L13 局部重绘预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
 
-        if disable_noise:
-            global_noise = torch.zeros(canvas.size(), dtype=canvas.dtype, layout=canvas.layout, device="cpu")
-        else:
-            global_noise = comfy.sample.prepare_noise(canvas, int(噪声种子), None)
-        detail_noise = None
-        if float(细节扰动) > 0:
-            detail_seed = (int(噪声种子) + 0x9E3779B97F4A7C15) & 0xffffffffffffffff
-            detail_noise = _normalize_detail_noise(comfy.sample.prepare_noise(canvas, detail_seed, None))
+        sampler_steps = _effective_sampler_steps(总步数, 起始步, 结束步)
+        progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率)
+        current_pixels = 参考图像
+        canvas = None
+        stage_count = len(stage_plans)
+        decay = float(递进强度衰减)
 
-        protect_mask = None
-        if 主体保护遮罩 is not None:
-            protect_mask = _scale_mask(主体保护遮罩, width, height, canvas.device, canvas.dtype)
-            protect_mask = protect_mask.clamp(0.0, 1.0)
+        for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, tiles) in enumerate(stage_plans):
+            base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
+            base = comfy.sample.fix_empty_latent_channels(模型, base)
+            canvas = base.clone()
+            stage_denoise = float(重绘强度)
+            if stage_count > 1:
+                stage_denoise = max(0.01, min(1.0, stage_denoise * (decay ** stage_index)))
 
-        progress = _CanvasProgress(模型, total_tile_runs, 预览频率)
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        for pass_index in range(max(1, int(重绘轮数))):
-            accum = torch.zeros_like(canvas)
-            weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
+            if disable_noise:
+                global_noise = torch.zeros(canvas.size(), dtype=canvas.dtype, layout=canvas.layout, device="cpu")
+            else:
+                global_noise = comfy.sample.prepare_noise(canvas, int(噪声种子), None)
+            detail_noise = None
+            if float(细节扰动) > 0:
+                detail_seed = (int(噪声种子) + 0x9E3779B97F4A7C15) & 0xffffffffffffffff
+                detail_noise = _normalize_detail_noise(comfy.sample.prepare_noise(canvas, detail_seed, None))
 
-            for tile_index, (y0, y1, x0, x1) in enumerate(tiles):
-                cy0 = max(0, y0 - context)
-                cy1 = min(height, y1 + context)
-                cx0 = max(0, x0 - context)
-                cx1 = min(width, x1 + context)
-                iy0 = y0 - cy0
-                iy1 = iy0 + (y1 - y0)
-                ix0 = x0 - cx0
-                ix1 = ix0 + (x1 - x0)
+            protect_mask = None
+            if 主体保护遮罩 is not None:
+                protect_mask = _scale_mask(主体保护遮罩, width, height, canvas.device, canvas.dtype)
+                protect_mask = protect_mask.clamp(0.0, 1.0)
 
-                context_latent = canvas[:, :, cy0:cy1, cx0:cx1].clone()
-                context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
-                noise_mask = torch.zeros((canvas.shape[0], 1, cy1 - cy0, cx1 - cx0), device=canvas.device, dtype=canvas.dtype)
-                noise_mask[:, :, iy0:iy1, ix0:ix1] = 1.0
-                if protect_mask is not None and 主体保护强度 > 0:
-                    local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
-                    noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
-                if detail_noise is not None:
-                    local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
-                    context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
+            for pass_index in range(pass_count):
+                accum = torch.zeros_like(canvas)
+                weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
 
-                out_context = self._sample_tile(
-                    模型,
-                    正向条件,
-                    负向条件,
-                    context_latent,
-                    context_noise,
-                    noise_mask,
-                    int(噪声种子),
-                    总步数,
-                    CFG引导,
-                    采样器,
-                    调度器,
-                    重绘强度,
-                    disable_pbar,
-                    disable_noise=disable_noise,
-                    start_step=起始步,
-                    last_step=结束步,
-                    force_full_denoise=force_full_denoise,
-                    callback=progress.tile_callback(),
-                )
-                out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
-                weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
-                accum[:, :, y0:y1, x0:x1] += out_tile * weight
-                weights[:, :, y0:y1, x0:x1] += weight
-                progress.update(force_preview=(预览频率 == "每轮" and tile_index == len(tiles) - 1))
+                for tile_index, (y0, y1, x0, x1) in enumerate(tiles):
+                    cy0 = max(0, y0 - context)
+                    cy1 = min(height, y1 + context)
+                    cx0 = max(0, x0 - context)
+                    cx1 = min(width, x1 + context)
+                    iy0 = y0 - cy0
+                    iy1 = iy0 + (y1 - y0)
+                    ix0 = x0 - cx0
+                    ix1 = ix0 + (x1 - x0)
 
-            canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
+                    context_latent = canvas[:, :, cy0:cy1, cx0:cx1].clone()
+                    context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
+                    noise_mask = torch.zeros((canvas.shape[0], 1, cy1 - cy0, cx1 - cx0), device=canvas.device, dtype=canvas.dtype)
+                    noise_mask[:, :, iy0:iy1, ix0:ix1] = 1.0
+                    if protect_mask is not None and 主体保护强度 > 0:
+                        local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
+                        noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                    if detail_noise is not None:
+                        local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
+                        context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
+
+                    progress.start_tile(sampler_steps)
+                    out_context = self._sample_tile(
+                        模型,
+                        正向条件,
+                        负向条件,
+                        context_latent,
+                        context_noise,
+                        noise_mask,
+                        int(噪声种子),
+                        总步数,
+                        CFG引导,
+                        采样器,
+                        调度器,
+                        stage_denoise,
+                        True,
+                        disable_noise=disable_noise,
+                        start_step=起始步,
+                        last_step=结束步,
+                        force_full_denoise=force_full_denoise,
+                        callback=progress.tile_callback(),
+                    )
+                    progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每轮" and tile_index == len(tiles) - 1))
+                    out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
+                    weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
+                    accum[:, :, y0:y1, x0:x1] += out_tile * weight
+                    weights[:, :, y0:y1, x0:x1] += weight
+
+                canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
+                if 预览频率 == "每轮":
+                    progress.force_preview()
+
+            if stage_index < stage_count - 1:
+                current_pixels = _vae_decode_latent(VAE, canvas)
 
         return ({"samples": canvas},)
 
@@ -969,6 +1091,8 @@ class L13ContextMaskedRedraw8K:
         目标规格,
         目标宽度,
         目标高度,
+        递进放大模式,
+        递进强度衰减,
         重绘强度,
         细节扰动,
         分块宽度,
@@ -998,6 +1122,8 @@ class L13ContextMaskedRedraw8K:
             目标规格,
             目标宽度,
             目标高度,
+            递进放大模式,
+            递进强度衰减,
             重绘强度,
             细节扰动,
             分块宽度,
@@ -1040,6 +1166,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "目标规格": (cls.target_sizes, {"tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "递进放大模式": (cls.progressive_modes, {"tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
+                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时重绘强度的乘数。0.85 表示越接近最终尺寸越保守；关闭递进时忽略。"}),
                 "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。高级分段继续跑时可用 1.0；参考图局部细化人物建议 0.12-0.22。"}),
                 "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
                 "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
@@ -1080,6 +1208,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         目标规格,
         目标宽度,
         目标高度,
+        递进放大模式,
+        递进强度衰减,
         重绘强度,
         细节扰动,
         分块宽度,
@@ -1109,6 +1239,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             目标规格,
             目标宽度,
             目标高度,
+            递进放大模式,
+            递进强度衰减,
             重绘强度,
             细节扰动,
             分块宽度,
@@ -1140,6 +1272,6 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": "Guided Tiled KSampler 8K (Layer13)",
     "Layer13GuidedTiledKSamplerAdvanced8K": "Guided Tiled KSampler Advanced 8K (Layer13)",
-    "Layer13ContextMaskedRedraw8K": "L13 局部重绘 8K 采样器",
-    "Layer13ContextMaskedRedrawAdvanced8K": "L13 局部重绘 8K 高级采样器",
+    "Layer13ContextMaskedRedraw8K": "L13分块采样放大",
+    "Layer13ContextMaskedRedrawAdvanced8K": "L13分块采样放大（高级）",
 }

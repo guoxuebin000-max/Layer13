@@ -20,9 +20,9 @@ Then restart ComfyUI.
 
 `sampling/guided_tiled -> Guided Tiled KSampler Advanced 8K (Layer13)`
 
-`sampling/l13_redraw -> L13 局部重绘 8K 采样器`
+`sampling/l13_redraw -> L13分块采样放大`
 
-`sampling/l13_redraw -> L13 局部重绘 8K 高级采样器`
+`sampling/l13_redraw -> L13分块采样放大（高级）`
 
 ## L13 Context Redraw Workflow
 
@@ -44,14 +44,18 @@ Recommended人物 8K defaults:
 - `重绘轮数`: `1`
 - `预览频率`: `每个分块`
 - `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质
+- `递进放大模式`: `平衡1024阶梯` for人物 4K/8K; use `快速2倍` for背景 when speed matters.
+- `递进强度衰减`: `0.85`
 
-The progress bar advances by tile segment. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style `x0` preview for the current tile segment after each tile is sampled, similar to a local detailer pass.
+The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style `x0` preview for the current tile segment while it is sampling, similar to a local detailer pass.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 
+`递进放大模式` creates intermediate canvases before the final size. For example, a 1024px source targeting 4K with `平衡1024阶梯` runs approximately `2048 -> 3072 -> 4096`. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
+
 ## L13 Advanced Context Redraw
 
-`L13 局部重绘 8K 高级采样器` uses the same reference image, context crop, center `noise_mask`, and feather writeback path as the normal node, but exposes KSampler Advanced controls:
+`L13分块采样放大（高级）` uses the same reference image, context crop, center `noise_mask`, progressive stages, and feather writeback path as the normal node, but exposes KSampler Advanced controls:
 
 - `加噪`
 - `噪声种子`

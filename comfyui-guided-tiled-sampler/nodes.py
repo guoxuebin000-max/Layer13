@@ -737,6 +737,67 @@ class L13RedrawSettings:
         },)
 
 
+class L13AdvancedRedrawSettings:
+    blend_modes = BLEND_CHOICES
+    tile_orders = TILE_ORDER_CHOICES
+    image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持输入比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持输入比例。"}),
+                "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
+                "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
+                "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
+                "上下文像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "采样缓冲像素": ("INT", {"default": 64, "min": 0, "max": 2048, "step": 8, "tooltip": "中心写回区外额外允许采样的一圈 halo；参与采样但不写回。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
+                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把参考图像或 clean latent 解码图缩放到目标尺寸时使用的算法。"}),
+                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
+            }
+        }
+
+    RETURN_TYPES = ("L13_ADVANCED_REDRAW_SETTINGS",)
+    RETURN_NAMES = ("高级参数",)
+    FUNCTION = "build"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "Structural settings bundle for L13 advanced redraw. No denoise/redraw-strength controls."
+
+    def build(
+        self,
+        目标宽度,
+        目标高度,
+        分块宽度,
+        分块高度,
+        重叠像素,
+        上下文像素,
+        采样缓冲像素,
+        融合方式,
+        图像缩放算法,
+        分块顺序,
+        预览频率,
+        最大分块数,
+    ):
+        return ({
+            "目标宽度": 目标宽度,
+            "目标高度": 目标高度,
+            "分块宽度": 分块宽度,
+            "分块高度": 分块高度,
+            "重叠像素": 重叠像素,
+            "上下文像素": 上下文像素,
+            "采样缓冲像素": 采样缓冲像素,
+            "融合方式": 融合方式,
+            "图像缩放算法": 图像缩放算法,
+            "分块顺序": 分块顺序,
+            "预览频率": 预览频率,
+            "最大分块数": 最大分块数,
+        },)
+
+
 class L13ImageColorMatch:
     methods = COLOR_MATCH_METHOD_CHOICES
 
@@ -1392,10 +1453,15 @@ class L13ContextMaskedRedraw8K:
         leftover_noise = LEFTOVER_NOISE_MAP[保留剩余噪声]
         disable_noise = add_noise == "disable"
         force_full_denoise = leftover_noise == "disable"
-        if 高级采样器逻辑 and disable_noise and 起始步 is not None and int(起始步) > 0:
-            if not (isinstance(输入潜空间, dict) and "samples" in 输入潜空间):
-                raise RuntimeError("高级版设置为 加噪=禁用 且 起始步>0 时，必须连接上一段输出到 输入潜空间。否则没有可继续采样的带噪 latent。")
         scale = _vae_scale(VAE)
+        reference_pixels = 参考图像
+        if reference_pixels is None:
+            if isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
+                latent_samples = comfy.sample.fix_empty_latent_channels(模型, 输入潜空间["samples"])
+                reference_pixels = _vae_decode_latent(VAE, latent_samples)
+            else:
+                raise RuntimeError("L13 参考重绘放大需要连接 参考图像；如果不接参考图像，则必须连接不带噪的 输入潜空间 作为参考来源。")
+
         pass_count = max(1, int(重绘轮数))
         safety_enabled = _enabled(人物安全模式)
         seam_enabled = _enabled(接缝修复)
@@ -1428,7 +1494,7 @@ class L13ContextMaskedRedraw8K:
             接缝宽度,
         )
         stage_pixels = _progressive_stage_pixels(
-            参考图像,
+            reference_pixels,
             目标规格,
             目标宽度,
             目标高度,
@@ -1449,9 +1515,6 @@ class L13ContextMaskedRedraw8K:
             tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
             stage_plans.append((stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles))
 
-        if 高级采样器逻辑 and 递进放大模式 != "关闭":
-            raise RuntimeError("高级版按 KSampler Advanced 的固定尺寸时间线运行，不支持递进放大模式。请把 递进放大模式 设为 关闭；递进放大请使用普通版。")
-
         seam_runs = len(stage_plans[-1][-1]) if seam_enabled and 接缝宽度 > 0 and len(stage_plans[-1][-1]) > 1 else 0
         total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans) + seam_runs
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
@@ -1459,14 +1522,14 @@ class L13ContextMaskedRedraw8K:
 
         sampler_steps = _effective_sampler_steps(总步数, 起始步, 结束步)
         progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率, VAE)
-        current_pixels = 参考图像
+        current_pixels = reference_pixels
         canvas = None
         stage_count = len(stage_plans)
         decay = float(递进强度衰减)
 
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
             if stage_index == 0 and isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
-                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale, allow_resize=not 高级采样器逻辑)
+                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale, allow_resize=True)
             else:
                 base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
@@ -1751,8 +1814,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         return {
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
-                "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
-                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。高级版仍以参考图像为全局锚点，不做自由分块 txt2img。"}),
+                "VAE": ("VAE", {"tooltip": "用于编码参考图像、解码 clean latent 兜底参考，以及 8K tiled VAE encode/decode。"}),
                 "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
                 "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
                 "总步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "完整采样时间线的总步数。高级分段时每一段都填同一个总步数。"}),
@@ -1765,12 +1827,12 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
-                "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
             },
             "optional": {
-                "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
+                "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
-                "输入潜空间": ("LATENT", {"tooltip": "可选。接上一段 KSampler Advanced/本节点高级版输出时，会优先用这个 latent 作为本段采样起点；不接则从参考图像重编码开始。"}),
+                "输入潜空间": ("LATENT", {"tooltip": "可选。若同时接参考图像，则 latent 作为起始画布直接缩放，参考图像仍作为参考来源；若未接参考图像，则会解码此 latent 作为参考图像，此时必须是不带噪的 clean latent。"}),
+                "参考图像": ("IMAGE", {"tooltip": "可选但优先级最高。连接后必须作为参考来源；输入潜空间只作为可选起始 latent 画布。未连接时才会解码 输入潜空间 作为参考图像。"}),
             }
         }
 
@@ -1780,7 +1842,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         self,
         模型,
         VAE,
-        参考图像,
         加噪,
         噪声种子,
         总步数,
@@ -1793,7 +1854,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         结束步,
         保留剩余噪声,
         目标规格,
-        递进放大模式,
         目标宽度=8192,
         目标高度=8192,
         递进强度衰减=0.85,
@@ -1821,6 +1881,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         主体保护遮罩=None,
         主体保护强度=0.55,
         输入潜空间=None,
+        参考图像=None,
     ):
         return self._run_redraw(
             模型,
@@ -1838,7 +1899,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             目标规格,
             目标宽度,
             目标高度,
-            递进放大模式,
+            "关闭",
             递进强度衰减,
             1.0,
             细节扰动,
@@ -1877,6 +1938,7 @@ NODE_CLASS_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": GuidedTiledKSampler8K,
     "Layer13GuidedTiledKSamplerAdvanced8K": GuidedTiledKSamplerAdvanced8K,
     "Layer13RedrawSettings": L13RedrawSettings,
+    "Layer13AdvancedRedrawSettings": L13AdvancedRedrawSettings,
     "Layer13ImageColorMatch": L13ImageColorMatch,
     "Layer13ContextMaskedRedraw8K": L13ContextMaskedRedraw8K,
     "Layer13ContextMaskedRedrawAdvanced8K": L13ContextMaskedRedrawAdvanced8K,
@@ -1886,6 +1948,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": "Guided Tiled KSampler 8K (Layer13)",
     "Layer13GuidedTiledKSamplerAdvanced8K": "Guided Tiled KSampler Advanced 8K (Layer13)",
     "Layer13RedrawSettings": "L13 参考重绘放大参数",
+    "Layer13AdvancedRedrawSettings": "L13 参考重绘放大参数（高级）",
     "Layer13ImageColorMatch": "L13 图像颜色匹配",
     "Layer13ContextMaskedRedraw8K": "L13 参考重绘放大",
     "Layer13ContextMaskedRedrawAdvanced8K": "L13 参考重绘放大（高级）",

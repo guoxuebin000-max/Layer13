@@ -900,8 +900,8 @@ class L13ContextMaskedRedraw8K:
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
                 "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会像局部细化节点一样显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
-                "色彩稳定强度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把每个采样 tile 的 latent 均值和对比度拉回参考图，防止二段采样发灰、低饱和。0 关闭，0.6-0.9 更保色。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.08-0.18。"}),
+                "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
             },
             "optional": {
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
@@ -995,8 +995,8 @@ class L13ContextMaskedRedraw8K:
         重绘轮数,
         分块顺序,
         最大分块数,
-        色彩稳定强度=0.75,
-        参考保留强度=0.12,
+        色彩稳定强度=0.0,
+        参考保留强度=0.06,
         预览频率="每个分块",
         加噪="启用",
         起始步=None,
@@ -1115,8 +1115,9 @@ class L13ContextMaskedRedraw8K:
                     progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每个分块"))
                     out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                     base_tile = base[:, :, y0:y1, x0:x1]
-                    out_tile = _match_latent_moments(out_tile, base_tile, 色彩稳定强度)
-                    out_tile = _blend_reference_latent(out_tile, base_tile, 参考保留强度)
+                    compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
+                    reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                    out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
                     weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
                     accum[:, :, y0:y1, x0:x1] += out_tile * weight
                     weights[:, :, y0:y1, x0:x1] += weight
@@ -1239,8 +1240,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
                 "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
-                "色彩稳定强度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把每个采样 tile 的 latent 均值和对比度拉回参考图，防止二段采样发灰、低饱和。0 关闭，0.6-0.9 更保色。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.08-0.18。"}),
+                "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
             },
             "optional": {
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),

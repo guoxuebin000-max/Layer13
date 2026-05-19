@@ -359,7 +359,6 @@ class _CanvasProgress:
         self.tile_steps = 1
         self.preview_mode = preview_mode
         self.pbar = comfy.utils.ProgressBar(self.total)
-        self.vae = vae
         self.previewer = None
         self.last_preview = None
         if preview_mode != "关闭":
@@ -375,40 +374,27 @@ class _CanvasProgress:
     def tile_callback(self):
         def callback(step, x0, x, total_steps):
             current = min(self.total, self.tile_start + max(1, int(step) + 1))
-            self.pbar.update_absolute(current, self.total, None)
+            preview = None
+            if self.preview_mode == "每个分块" and self.previewer is not None and x0 is not None:
+                try:
+                    preview = self.previewer.decode_latent_to_preview_image("JPEG", x0)
+                    self.last_preview = preview
+                except Exception as exc:
+                    logging.warning("L13 KSampler preview failed and will be disabled: %s", exc)
+                    self.previewer = None
+                    self.last_preview = None
+            self.pbar.update_absolute(current, self.total, preview)
 
         return callback
-
-    def _vae_preview_image(self, latent: torch.Tensor):
-        if self.vae is None:
-            return None
-        scale = _vae_scale(self.vae)
-        max_latent = max(1, 512 // max(1, scale))
-        preview_latent = latent[:1].detach()
-        latent_h = int(preview_latent.shape[-2])
-        latent_w = int(preview_latent.shape[-1])
-        if max(latent_h, latent_w) > max_latent:
-            if latent_w >= latent_h:
-                out_w = max_latent
-                out_h = max(1, int(round(max_latent * latent_h / latent_w)))
-            else:
-                out_h = max_latent
-                out_w = max(1, int(round(max_latent * latent_w / latent_h)))
-            preview_latent = comfy.utils.common_upscale(preview_latent, out_w, out_h, "bilinear", "disabled")
-        pixels = self.vae.decode(preview_latent)
-        return latent_preview.preview_to_image(pixels[0, :, :, :3], do_scale=False)
 
     def capture_preview(self, latent: torch.Tensor):
         if self.preview_mode == "关闭":
             return
         try:
-            image = self._vae_preview_image(latent)
-            if image is not None:
-                self.last_preview = ("JPEG", image, 512)
-            elif self.previewer is not None:
+            if self.previewer is not None:
                 self.last_preview = self.previewer.decode_latent_to_preview_image("JPEG", latent)
         except Exception as exc:
-            logging.warning("L13 stable preview failed and will be disabled: %s", exc)
+            logging.warning("L13 latent preview failed and will be disabled: %s", exc)
             self.previewer = None
             self.last_preview = None
 
@@ -898,7 +884,7 @@ class L13ContextMaskedRedraw8K:
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会像局部细化节点一样显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会使用 K采样器同款 latent 预览，逐步显示当前 context tile；每轮只在一整轮结束时更新；关闭只显示进度。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
@@ -1238,7 +1224,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会使用 K采样器同款 latent 预览，逐步显示当前 context tile；每轮只在一整轮结束时更新；关闭只显示进度。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),

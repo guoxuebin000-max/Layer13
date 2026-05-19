@@ -49,7 +49,7 @@ Recommended人物 8K defaults:
 - `色彩稳定强度`: `0`
 - `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.
 
-The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives a stable preview only after the current tile segment finishes sampling. Intermediate `x0` previews are suppressed because masked tile sampling can briefly produce stripe artifacts during early sampler steps.
+The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 

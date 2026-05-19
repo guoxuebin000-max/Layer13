@@ -1249,6 +1249,15 @@ class L13ContextMaskedRedraw8K:
         target_width, target_height = _target_pixels_from_image_ratio(reference_image, target_size, target_width, target_height, scale)
         return self._build_canvas_from_pixels(vae, reference_image, target_width, target_height, image_upscale)
 
+    def _build_canvas_from_latent(self, model, latent, target_width, target_height, scale):
+        samples = latent["samples"]
+        samples = comfy.sample.fix_empty_latent_channels(model, samples)
+        latent_w = max(1, int(target_width) // scale)
+        latent_h = max(1, int(target_height) // scale)
+        if samples.shape[-2:] != (latent_h, latent_w):
+            samples = comfy.utils.common_upscale(samples, latent_w, latent_h, "bislerp", "disabled")
+        return samples
+
     def _sample_tile(
         self,
         model,
@@ -1338,6 +1347,8 @@ class L13ContextMaskedRedraw8K:
         主体保护遮罩=None,
         主体保护强度=0.55,
         高级参数=None,
+        高级采样器逻辑=False,
+        输入潜空间=None,
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -1441,7 +1452,10 @@ class L13ContextMaskedRedraw8K:
         decay = float(递进强度衰减)
 
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
-            base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
+            if stage_index == 0 and isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
+                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale)
+            else:
+                base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
             canvas = base.clone()
             stage_denoise = float(重绘强度)
@@ -1500,6 +1514,10 @@ class L13ContextMaskedRedraw8K:
                             local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
                             noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
 
+                    sampler_denoise = 1.0 if 高级采样器逻辑 else effective_denoise
+                    if 高级采样器逻辑:
+                        noise_mask = noise_mask * max(0.0, min(1.0, float(effective_denoise)))
+
                     if detail_noise is not None:
                         local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
                         context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
@@ -1517,7 +1535,7 @@ class L13ContextMaskedRedraw8K:
                         CFG引导,
                         采样器,
                         调度器,
-                        effective_denoise,
+                        sampler_denoise,
                         True,
                         disable_noise=disable_noise,
                         start_step=起始步,
@@ -1570,6 +1588,9 @@ class L13ContextMaskedRedraw8K:
                         if protect_mask is not None and 主体保护强度 > 0:
                             local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
                             noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                        sampler_denoise = 1.0 if 高级采样器逻辑 else 接缝修复强度
+                        if 高级采样器逻辑:
+                            noise_mask = noise_mask * max(0.0, min(1.0, float(接缝修复强度)))
                         if noise_mask.max().item() <= 0:
                             progress.start_tile(sampler_steps)
                             progress.finish_tile(sampler_steps)
@@ -1588,7 +1609,7 @@ class L13ContextMaskedRedraw8K:
                             CFG引导,
                             采样器,
                             调度器,
-                            接缝修复强度,
+                            sampler_denoise,
                             True,
                             disable_noise=disable_noise,
                             start_step=起始步,
@@ -1733,11 +1754,12 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
-                "降噪": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "与 K采样器 denoise 同义。控制每个局部重绘 tile 的 img2img 去噪幅度；分段接力可按需要提高。"}),
+                "降噪": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版中不改变 sampler 时间线；采样区间由起始步/结束步控制。本值用于局部 mask 写回强度和主体保护上限。"}),
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
+                "输入潜空间": ("LATENT", {"tooltip": "可选。接上一段 KSampler Advanced/本节点高级版输出时，会优先用这个 latent 作为本段采样起点；不接则从参考图像重编码开始。"}),
             }
         }
 
@@ -1788,6 +1810,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
+        输入潜空间=None,
     ):
         return self._run_redraw(
             模型,
@@ -1835,6 +1858,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             高级参数=高级参数,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
+            高级采样器逻辑=True,
+            输入潜空间=输入潜空间,
         )
 
 

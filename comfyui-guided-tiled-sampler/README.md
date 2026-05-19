@@ -26,6 +26,8 @@ Then restart ComfyUI.
 
 `sampling/l13_redraw -> L13 参考重绘放大参数`
 
+`image/l13 -> L13 图像颜色匹配`
+
 ## L13 Reference Redraw Workflow
 
 This is the safer path for人物主体图. It does not directly upscale low-resolution latent. It uses the first-pass image as an anchor:
@@ -62,6 +64,8 @@ Recommended人物 8K defaults:
 The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
 
 The main `L13 参考重绘放大` nodes only declare workflow-level controls. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, redraw denoise, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+
+If the final decoded image looks gray or desaturated, connect `L13 图像颜色匹配` after VAE Decode and before Save Image. Feed the decoded output into `图像` and the original first-pass image into `参考图像`. Start with `颜色匹配强度 = 0.25 - 0.40`. `RGB均值方差` restores global color and contrast more directly; `YCbCr色度` mostly restores chroma and changes brightness less.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 

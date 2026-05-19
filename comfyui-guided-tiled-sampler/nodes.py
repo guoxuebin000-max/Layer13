@@ -23,6 +23,7 @@ PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
+COLOR_MATCH_METHOD_CHOICES = ["RGB均值方差", "YCbCr色度"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
@@ -158,6 +159,94 @@ def _scale_pixels(pixels: torch.Tensor, width: int, height: int, method: str) ->
     pixels = pixels[:, :, :, :3]
     scaled = comfy.utils.common_upscale(pixels.movedim(-1, 1), width, height, method, "disabled")
     return scaled.movedim(1, -1)
+
+
+def _downsample_for_color_stats(pixels: torch.Tensor, max_edge: int = 512) -> torch.Tensor:
+    height = max(1, int(pixels.shape[1]))
+    width = max(1, int(pixels.shape[2]))
+    long_edge = max(height, width)
+    if long_edge <= max_edge:
+        return pixels
+    scale = float(max_edge) / float(long_edge)
+    out_w = max(1, int(round(width * scale)))
+    out_h = max(1, int(round(height * scale)))
+    return comfy.utils.common_upscale(pixels.movedim(-1, 1), out_w, out_h, "area", "disabled").movedim(1, -1)
+
+
+def _rgb_to_ycbcr(pixels: torch.Tensor) -> torch.Tensor:
+    r = pixels[..., 0]
+    g = pixels[..., 1]
+    b = pixels[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 0.5
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 0.5
+    return torch.stack((y, cb, cr), dim=-1)
+
+
+def _ycbcr_to_rgb(pixels: torch.Tensor) -> torch.Tensor:
+    y = pixels[..., 0]
+    cb = pixels[..., 1] - 0.5
+    cr = pixels[..., 2] - 0.5
+    r = y + 1.402 * cr
+    g = y - 0.344136 * cb - 0.714136 * cr
+    b = y + 1.772 * cb
+    return torch.stack((r, g, b), dim=-1)
+
+
+def _color_stats(pixels: torch.Tensor, method: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    small = _downsample_for_color_stats(pixels[:, :, :, :3].clamp(0.0, 1.0))
+    if method == "YCbCr色度":
+        small = _rgb_to_ycbcr(small)
+    flat = small.reshape(small.shape[0], -1, 3)
+    mean = flat.mean(dim=1).view(flat.shape[0], 1, 1, 3)
+    std = flat.std(dim=1, unbiased=False).clamp_min(1e-4).view(flat.shape[0], 1, 1, 3)
+    return mean, std
+
+
+def _align_color_stats(stats: Tuple[torch.Tensor, torch.Tensor], batch: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    mean, std = stats
+    if mean.shape[0] == batch:
+        return mean, std
+    mean = mean[:1].expand(batch, -1, -1, -1)
+    std = std[:1].expand(batch, -1, -1, -1)
+    return mean, std
+
+
+def _match_image_color(
+    image: torch.Tensor,
+    reference: torch.Tensor,
+    strength: float,
+    method: str,
+    chunk_rows: int = 512,
+) -> torch.Tensor:
+    strength = _clamp_float(strength, 0.0, 1.0)
+    if strength <= 0:
+        return image
+
+    pixels = image[:, :, :, :3].clamp(0.0, 1.0)
+    reference = reference[:, :, :, :3].to(device=pixels.device, dtype=pixels.dtype).clamp(0.0, 1.0)
+    method = method if method in COLOR_MATCH_METHOD_CHOICES else "RGB均值方差"
+    source_mean, source_std = _color_stats(pixels, method)
+    target_mean, target_std = _align_color_stats(_color_stats(reference, method), pixels.shape[0])
+    ratio = (target_std / source_std).clamp(0.5, 2.0)
+
+    out = torch.empty_like(pixels)
+    rows = max(1, int(chunk_rows))
+    for y0 in range(0, int(pixels.shape[1]), rows):
+        y1 = min(int(pixels.shape[1]), y0 + rows)
+        chunk = pixels[:, y0:y1, :, :]
+        if method == "YCbCr色度":
+            source = _rgb_to_ycbcr(chunk)
+            matched = (source - source_mean) * ratio + target_mean
+            matched[..., 0] = source[..., 0] + (matched[..., 0] - source[..., 0]) * 0.35
+            matched = _ycbcr_to_rgb(matched)
+        else:
+            matched = (chunk - source_mean) * ratio + target_mean
+        out[:, y0:y1, :, :] = torch.lerp(chunk, matched, strength).clamp(0.0, 1.0)
+
+    if image.shape[-1] > 3:
+        return torch.cat((out, image[:, :, :, 3:]), dim=-1)
+    return out
 
 
 def _vae_encode_pixels(vae, pixels: torch.Tensor) -> torch.Tensor:
@@ -645,6 +734,30 @@ class L13RedrawSettings:
             "接缝宽度": 接缝宽度,
             "主体保护强度": 主体保护强度,
         },)
+
+
+class L13ImageColorMatch:
+    methods = COLOR_MATCH_METHOD_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "图像": ("IMAGE", {"tooltip": "需要修正颜色的最终图像，通常接在 VAE Decode 后面。"}),
+                "参考图像": ("IMAGE", {"tooltip": "第一段参考图像。节点会只读取低频颜色统计，不复制纹理。"}),
+                "颜色匹配强度": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "0 不改变颜色，1 完全匹配参考图低频颜色。建议 0.20-0.45。"}),
+                "匹配方式": (cls.methods, {"default": "RGB均值方差", "tooltip": "RGB均值方差更直接；YCbCr色度主要匹配色度，亮度只弱修正，更适合避免过度改明暗。"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("图像",)
+    FUNCTION = "match"
+    CATEGORY = "image/l13"
+    DESCRIPTION = "Pixel-space low-frequency color matching for L13 redraw outputs."
+
+    def match(self, 图像, 参考图像, 颜色匹配强度, 匹配方式):
+        return (_match_image_color(图像, 参考图像, 颜色匹配强度, 匹配方式),)
 
 
 def _crop_mask(mask: torch.Tensor, y0: int, y1: int, x0: int, x1: int) -> torch.Tensor:
@@ -1735,6 +1848,7 @@ NODE_CLASS_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": GuidedTiledKSampler8K,
     "Layer13GuidedTiledKSamplerAdvanced8K": GuidedTiledKSamplerAdvanced8K,
     "Layer13RedrawSettings": L13RedrawSettings,
+    "Layer13ImageColorMatch": L13ImageColorMatch,
     "Layer13ContextMaskedRedraw8K": L13ContextMaskedRedraw8K,
     "Layer13ContextMaskedRedrawAdvanced8K": L13ContextMaskedRedrawAdvanced8K,
 }
@@ -1743,6 +1857,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": "Guided Tiled KSampler 8K (Layer13)",
     "Layer13GuidedTiledKSamplerAdvanced8K": "Guided Tiled KSampler Advanced 8K (Layer13)",
     "Layer13RedrawSettings": "L13 参考重绘放大参数",
+    "Layer13ImageColorMatch": "L13 图像颜色匹配",
     "Layer13ContextMaskedRedraw8K": "L13 参考重绘放大",
     "Layer13ContextMaskedRedrawAdvanced8K": "L13 参考重绘放大（高级）",
 }

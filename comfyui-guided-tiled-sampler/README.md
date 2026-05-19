@@ -45,10 +45,10 @@ Recommended人物 8K defaults:
 - `降噪`: `0.12 - 0.22`
 - `CFG引导`: `1.0` by default for reference-anchored redraw; raise only if the prompt is too weak.
 - `采样器` / `调度器`: `euler` / `ddim_uniform`
-- `分块宽度` / `分块高度`: `1024 - 1536`
-- `重叠像素`: `192 - 256`
-- `上下文像素`: `384 - 512`
-- `采样缓冲像素`: `96 - 160`
+- `分块宽度` / `分块高度`: `1024` by default; raise to `1280 - 1536` for stronger consistency.
+- `重叠像素`: `128` by default; raise to `192 - 256` if seams appear.
+- `上下文像素`: `256` by default; raise to `384 - 512` if local redraw loses context.
+- `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
 - `重绘轮数`: `1`
 - `预览频率`: `每个分块`
 - `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质

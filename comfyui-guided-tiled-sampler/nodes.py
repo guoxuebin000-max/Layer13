@@ -23,6 +23,33 @@ PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
+L13_ADVANCED_INPUT_NAMES = [
+    "目标宽度",
+    "目标高度",
+    "递进强度衰减",
+    "重绘强度",
+    "细节扰动",
+    "分块宽度",
+    "分块高度",
+    "重叠像素",
+    "上下文像素",
+    "采样缓冲像素",
+    "融合方式",
+    "图像缩放算法",
+    "重绘轮数",
+    "分块顺序",
+    "预览频率",
+    "最大分块数",
+    "色彩稳定强度",
+    "参考保留强度",
+    "主体重绘上限",
+    "背景重绘倍率",
+    "主体判断阈值",
+    "接缝修复",
+    "接缝修复强度",
+    "接缝宽度",
+    "主体保护强度",
+]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
@@ -83,6 +110,16 @@ def _param(kwargs: Dict, *names: str, default=_MISSING):
     if default is not _MISSING:
         return default
     raise KeyError(f"Missing node input. Expected one of: {', '.join(names)}")
+
+
+def _mark_advanced_inputs(input_types: Dict, names: Sequence[str]) -> Dict:
+    for section in ("required", "optional"):
+        for name in names:
+            value = input_types.get(section, {}).get(name)
+            if not isinstance(value, tuple) or len(value) < 2 or not isinstance(value[1], dict):
+                continue
+            value[1]["advanced"] = True
+    return input_types
 
 
 def _target_pixels_with_long_edge(samples: torch.Tensor, long_edge: int) -> Tuple[int, int]:
@@ -547,6 +584,106 @@ class _CanvasProgress:
             self.pbar.update_absolute(self.completed, self.total, self.last_preview)
 
 
+class L13RedrawSettings:
+    blend_modes = BLEND_CHOICES
+    tile_orders = TILE_ORDER_CHOICES
+    image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时重绘强度的乘数。"}),
+                "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。人物 8K 建议 0.12-0.22，背景可到 0.30-0.35。"}),
+                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动。人物建议 0-0.01。"}),
+                "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
+                "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
+                "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
+                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "采样缓冲像素": ("INT", {"default": 96, "min": 0, "max": 2048, "step": 8, "tooltip": "中心写回区外额外允许采样的一圈 halo；参与 denoise 但不写回。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
+                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。"}),
+                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1。"}),
+                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
+                "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数；建议保持 0。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出。"}),
+                "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩占比较高的 tile 的 denoise 上限。"}),
+                "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 的重绘强度倍率。"}),
+                "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时按主体 tile 处理。"}),
+                "接缝修复": (["禁用", "启用"], {"tooltip": "最终阶段额外跑一轮低强度 seam pass。"}),
+                "接缝修复强度": ("FLOAT", {"default": 0.06, "min": 0.01, "max": 0.5, "step": 0.01, "round": 0.001, "tooltip": "接缝修复 pass 的 denoise。"}),
+                "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。"}),
+                "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。"}),
+            }
+        }
+
+    RETURN_TYPES = ("L13_REDRAW_SETTINGS",)
+    RETURN_NAMES = ("高级参数",)
+    FUNCTION = "build"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "External advanced settings bundle for L13 tiled redraw nodes."
+
+    def build(
+        self,
+        目标宽度,
+        目标高度,
+        递进强度衰减,
+        重绘强度,
+        细节扰动,
+        分块宽度,
+        分块高度,
+        重叠像素,
+        上下文像素,
+        采样缓冲像素,
+        融合方式,
+        图像缩放算法,
+        重绘轮数,
+        分块顺序,
+        预览频率,
+        最大分块数,
+        色彩稳定强度,
+        参考保留强度,
+        主体重绘上限,
+        背景重绘倍率,
+        主体判断阈值,
+        接缝修复,
+        接缝修复强度,
+        接缝宽度,
+        主体保护强度,
+    ):
+        return ({
+            "目标宽度": 目标宽度,
+            "目标高度": 目标高度,
+            "递进强度衰减": 递进强度衰减,
+            "重绘强度": 重绘强度,
+            "细节扰动": 细节扰动,
+            "分块宽度": 分块宽度,
+            "分块高度": 分块高度,
+            "重叠像素": 重叠像素,
+            "上下文像素": 上下文像素,
+            "采样缓冲像素": 采样缓冲像素,
+            "融合方式": 融合方式,
+            "图像缩放算法": 图像缩放算法,
+            "重绘轮数": 重绘轮数,
+            "分块顺序": 分块顺序,
+            "预览频率": 预览频率,
+            "最大分块数": 最大分块数,
+            "色彩稳定强度": 色彩稳定强度,
+            "参考保留强度": 参考保留强度,
+            "主体重绘上限": 主体重绘上限,
+            "背景重绘倍率": 背景重绘倍率,
+            "主体判断阈值": 主体判断阈值,
+            "接缝修复": 接缝修复,
+            "接缝修复强度": 接缝修复强度,
+            "接缝宽度": 接缝宽度,
+            "主体保护强度": 主体保护强度,
+        },)
+
+
 def _crop_mask(mask: torch.Tensor, y0: int, y1: int, x0: int, x1: int) -> torch.Tensor:
     if mask.ndim < 2:
         return mask
@@ -997,7 +1134,7 @@ class L13ContextMaskedRedraw8K:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        return _mark_advanced_inputs({
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。第二段会用同一模型在高分辨率 latent 上做 masked img2img。"}),
                 "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
@@ -1039,10 +1176,11 @@ class L13ContextMaskedRedraw8K:
                 "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
+                "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
                 "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
             }
-        }
+        }, L13_ADVANCED_INPUT_NAMES)
 
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("samples",)
@@ -1148,7 +1286,39 @@ class L13ContextMaskedRedraw8K:
         保留剩余噪声="禁用",
         主体保护遮罩=None,
         主体保护强度=0.55,
+        高级参数=None,
     ):
+        if isinstance(高级参数, dict):
+            def setting(name, current):
+                value = 高级参数.get(name, current)
+                return current if value is None else value
+
+            目标宽度 = setting("目标宽度", 目标宽度)
+            目标高度 = setting("目标高度", 目标高度)
+            递进强度衰减 = setting("递进强度衰减", 递进强度衰减)
+            重绘强度 = setting("重绘强度", 重绘强度)
+            细节扰动 = setting("细节扰动", 细节扰动)
+            分块宽度 = setting("分块宽度", 分块宽度)
+            分块高度 = setting("分块高度", 分块高度)
+            重叠像素 = setting("重叠像素", 重叠像素)
+            上下文像素 = setting("上下文像素", 上下文像素)
+            采样缓冲像素 = setting("采样缓冲像素", 采样缓冲像素)
+            融合方式 = setting("融合方式", 融合方式)
+            图像缩放算法 = setting("图像缩放算法", 图像缩放算法)
+            重绘轮数 = setting("重绘轮数", 重绘轮数)
+            分块顺序 = setting("分块顺序", 分块顺序)
+            最大分块数 = setting("最大分块数", 最大分块数)
+            色彩稳定强度 = setting("色彩稳定强度", 色彩稳定强度)
+            参考保留强度 = setting("参考保留强度", 参考保留强度)
+            主体重绘上限 = setting("主体重绘上限", 主体重绘上限)
+            背景重绘倍率 = setting("背景重绘倍率", 背景重绘倍率)
+            主体判断阈值 = setting("主体判断阈值", 主体判断阈值)
+            接缝修复 = setting("接缝修复", 接缝修复)
+            接缝修复强度 = setting("接缝修复强度", 接缝修复强度)
+            接缝宽度 = setting("接缝宽度", 接缝宽度)
+            预览频率 = setting("预览频率", 预览频率)
+            主体保护强度 = setting("主体保护强度", 主体保护强度)
+
         blend = BLEND_MAP[融合方式]
         add_noise = ADD_NOISE_MAP[加噪]
         leftover_noise = LEFTOVER_NOISE_MAP[保留剩余噪声]
@@ -1211,7 +1381,7 @@ class L13ContextMaskedRedraw8K:
         seam_runs = len(stage_plans[-1][-1]) if seam_enabled and 接缝宽度 > 0 and len(stage_plans[-1][-1]) > 1 else 0
         total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans) + seam_runs
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
-            raise RuntimeError(f"L13 局部重绘预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
+            raise RuntimeError(f"L13 参考重绘放大预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
 
         sampler_steps = _effective_sampler_steps(总步数, 起始步, 结束步)
         progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率, VAE)
@@ -1442,6 +1612,7 @@ class L13ContextMaskedRedraw8K:
         接缝修复强度,
         接缝宽度,
         预览频率="每个分块",
+        高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
     ):
@@ -1484,6 +1655,7 @@ class L13ContextMaskedRedraw8K:
             接缝修复强度,
             接缝宽度,
             预览频率=预览频率,
+            高级参数=高级参数,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
         )
@@ -1495,7 +1667,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
+        return _mark_advanced_inputs({
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
                 "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
@@ -1541,10 +1713,11 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
+                "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
                 "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
             }
-        }
+        }, L13_ADVANCED_INPUT_NAMES)
 
     DESCRIPTION = "KSampler Advanced style reference-anchored context masked redraw pass for 4K/8K latent canvases."
 
@@ -1592,6 +1765,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         接缝修复强度,
         接缝宽度,
         预览频率="每个分块",
+        高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
     ):
@@ -1638,6 +1812,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             起始步=起始步,
             结束步=结束步,
             保留剩余噪声=保留剩余噪声,
+            高级参数=高级参数,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
         )
@@ -1646,6 +1821,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
 NODE_CLASS_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": GuidedTiledKSampler8K,
     "Layer13GuidedTiledKSamplerAdvanced8K": GuidedTiledKSamplerAdvanced8K,
+    "Layer13RedrawSettings": L13RedrawSettings,
     "Layer13ContextMaskedRedraw8K": L13ContextMaskedRedraw8K,
     "Layer13ContextMaskedRedrawAdvanced8K": L13ContextMaskedRedrawAdvanced8K,
 }
@@ -1653,6 +1829,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Layer13GuidedTiledKSampler8K": "Guided Tiled KSampler 8K (Layer13)",
     "Layer13GuidedTiledKSamplerAdvanced8K": "Guided Tiled KSampler Advanced 8K (Layer13)",
-    "Layer13ContextMaskedRedraw8K": "L13分块采样放大",
-    "Layer13ContextMaskedRedrawAdvanced8K": "L13分块采样放大（高级）",
+    "Layer13RedrawSettings": "L13 参考重绘放大参数",
+    "Layer13ContextMaskedRedraw8K": "L13 参考重绘放大",
+    "Layer13ContextMaskedRedrawAdvanced8K": "L13 参考重绘放大（高级）",
 }

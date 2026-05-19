@@ -20,11 +20,13 @@ Then restart ComfyUI.
 
 `sampling/guided_tiled -> Guided Tiled KSampler Advanced 8K (Layer13)`
 
-`sampling/l13_redraw -> L13分块采样放大`
+`sampling/l13_redraw -> L13 参考重绘放大`
 
-`sampling/l13_redraw -> L13分块采样放大（高级）`
+`sampling/l13_redraw -> L13 参考重绘放大（高级）`
 
-## L13 Context Redraw Workflow
+`sampling/l13_redraw -> L13 参考重绘放大参数`
+
+## L13 Reference Redraw Workflow
 
 This is the safer path for人物主体图. It does not directly upscale low-resolution latent. It uses the first-pass image as an anchor:
 
@@ -59,6 +61,8 @@ Recommended人物 8K defaults:
 
 The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
 
+The main `L13 参考重绘放大` nodes keep only the workflow-level controls visible and mark size/tile/detail controls as advanced. If you want a cleaner graph or want to share the same advanced settings between normal and advanced nodes, add `L13 参考重绘放大参数` and connect its `高级参数` output to the main node. Connected `高级参数` overrides the folded advanced controls on the main node, including custom width/height, redraw denoise, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 
 `采样缓冲像素` separates the sampled area from the written area. Each tile now samples `write core + sample halo` inside the larger context crop, but only writes the original center tile back to the full latent canvas. This reduces hard mask edges while keeping context read-only.
@@ -73,7 +77,7 @@ The progress bar advances by sampler step across all progressive stages, passes,
 
 ## L13 Advanced Context Redraw
 
-`L13分块采样放大（高级）` uses the same reference image, context crop, center `noise_mask`, progressive stages, and feather writeback path as the normal node, but exposes KSampler Advanced controls:
+`L13 参考重绘放大（高级）` uses the same reference image, context crop, center `noise_mask`, progressive stages, and feather writeback path as the normal node, but exposes KSampler Advanced controls:
 
 - `加噪`
 - `噪声种子`

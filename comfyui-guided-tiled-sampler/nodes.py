@@ -1249,12 +1249,19 @@ class L13ContextMaskedRedraw8K:
         target_width, target_height = _target_pixels_from_image_ratio(reference_image, target_size, target_width, target_height, scale)
         return self._build_canvas_from_pixels(vae, reference_image, target_width, target_height, image_upscale)
 
-    def _build_canvas_from_latent(self, model, latent, target_width, target_height, scale):
+    def _build_canvas_from_latent(self, model, latent, target_width, target_height, scale, allow_resize=True):
         samples = latent["samples"]
         samples = comfy.sample.fix_empty_latent_channels(model, samples)
         latent_w = max(1, int(target_width) // scale)
         latent_h = max(1, int(target_height) // scale)
         if samples.shape[-2:] != (latent_h, latent_w):
+            if not allow_resize:
+                got_h, got_w = samples.shape[-2:]
+                raise RuntimeError(
+                    f"高级版的 输入潜空间 必须已经是目标 latent 尺寸 {latent_w}x{latent_h}，"
+                    f"当前是 {got_w}x{got_h}。带噪 latent 不能直接缩放后继续采样；"
+                    f"请关闭递进放大并使用同目标尺寸的 leftover latent，或不接 输入潜空间、改用 加噪=启用 从参考图高分 latent 的起始步继续。"
+                )
             samples = comfy.utils.common_upscale(samples, latent_w, latent_h, "bislerp", "disabled")
         return samples
 
@@ -1385,6 +1392,9 @@ class L13ContextMaskedRedraw8K:
         leftover_noise = LEFTOVER_NOISE_MAP[保留剩余噪声]
         disable_noise = add_noise == "disable"
         force_full_denoise = leftover_noise == "disable"
+        if 高级采样器逻辑 and disable_noise and 起始步 is not None and int(起始步) > 0:
+            if not (isinstance(输入潜空间, dict) and "samples" in 输入潜空间):
+                raise RuntimeError("高级版设置为 加噪=禁用 且 起始步>0 时，必须连接上一段输出到 输入潜空间。否则没有可继续采样的带噪 latent。")
         scale = _vae_scale(VAE)
         pass_count = max(1, int(重绘轮数))
         safety_enabled = _enabled(人物安全模式)
@@ -1439,6 +1449,9 @@ class L13ContextMaskedRedraw8K:
             tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
             stage_plans.append((stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles))
 
+        if 高级采样器逻辑 and 递进放大模式 != "关闭":
+            raise RuntimeError("高级版按 KSampler Advanced 的固定尺寸时间线运行，不支持递进放大模式。请把 递进放大模式 设为 关闭；递进放大请使用普通版。")
+
         seam_runs = len(stage_plans[-1][-1]) if seam_enabled and 接缝宽度 > 0 and len(stage_plans[-1][-1]) > 1 else 0
         total_tile_runs = sum(len(plan[-1]) * pass_count for plan in stage_plans) + seam_runs
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
@@ -1453,7 +1466,7 @@ class L13ContextMaskedRedraw8K:
 
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
             if stage_index == 0 and isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
-                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale)
+                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale, allow_resize=not 高级采样器逻辑)
             else:
                 base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
@@ -1504,7 +1517,7 @@ class L13ContextMaskedRedraw8K:
                     noise_mask[:, :, sy0i:sy1i, sx0i:sx1i] = 1.0
                     effective_denoise = stage_denoise
 
-                    if protect_mask is not None:
+                    if protect_mask is not None and not 高级采样器逻辑:
                         subject_ratio = float(protect_mask[:, :, y0:y1, x0:x1].mean().item())
                         if subject_ratio >= float(主体判断阈值):
                             effective_denoise = min(effective_denoise, float(主体重绘上限))
@@ -1513,10 +1526,11 @@ class L13ContextMaskedRedraw8K:
                         if 主体保护强度 > 0:
                             local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
                             noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                    elif protect_mask is not None and 主体保护强度 > 0:
+                        local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
+                        noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
 
                     sampler_denoise = 1.0 if 高级采样器逻辑 else effective_denoise
-                    if 高级采样器逻辑:
-                        noise_mask = noise_mask * max(0.0, min(1.0, float(effective_denoise)))
 
                     if detail_noise is not None:
                         local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
@@ -1549,7 +1563,7 @@ class L13ContextMaskedRedraw8K:
                     out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                     base_tile = base[:, :, y0:y1, x0:x1]
                     compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
-                    reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                    reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                     out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
                     weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
                     accum[:, :, y0:y1, x0:x1] += out_tile * weight
@@ -1589,8 +1603,6 @@ class L13ContextMaskedRedraw8K:
                             local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
                             noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
                         sampler_denoise = 1.0 if 高级采样器逻辑 else 接缝修复强度
-                        if 高级采样器逻辑:
-                            noise_mask = noise_mask * max(0.0, min(1.0, float(接缝修复强度)))
                         if noise_mask.max().item() <= 0:
                             progress.start_tile(sampler_steps)
                             progress.finish_tile(sampler_steps)
@@ -1623,7 +1635,7 @@ class L13ContextMaskedRedraw8K:
                         out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                         base_tile = base[:, :, y0:y1, x0:x1]
                         compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
-                        reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                        reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                         out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
                         seam_weight = seam_mask[:, :, y0:y1, x0:x1].repeat(canvas.shape[0], 1, 1, 1)
                         weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
@@ -1754,7 +1766,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
-                "降噪": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版中不改变 sampler 时间线；采样区间由起始步/结束步控制。本值用于局部 mask 写回强度和主体保护上限。"}),
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
@@ -1782,7 +1793,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         结束步,
         保留剩余噪声,
         目标规格,
-        降噪,
         递进放大模式,
         目标宽度=8192,
         目标高度=8192,
@@ -1830,7 +1840,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             目标高度,
             递进放大模式,
             递进强度衰减,
-            降噪,
+            1.0,
             细节扰动,
             分块宽度,
             分块高度,

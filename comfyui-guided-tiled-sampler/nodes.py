@@ -1368,6 +1368,49 @@ class L13ContextMaskedRedraw8K:
             seed=seed,
         )
 
+    def _sample_native_reference_latent(
+        self,
+        model,
+        positive,
+        negative,
+        latent_samples,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        disable_noise=False,
+        start_step=None,
+        last_step=None,
+        force_full_denoise=False,
+    ):
+        canvas = comfy.sample.fix_empty_latent_channels(model, latent_samples).clone()
+        if disable_noise:
+            noise = torch.zeros(canvas.size(), dtype=canvas.dtype, layout=canvas.layout, device="cpu")
+        else:
+            noise = comfy.sample.prepare_noise(canvas, int(seed), None)
+        noise_mask = torch.ones((canvas.shape[0], 1, canvas.shape[-2], canvas.shape[-1]), device=canvas.device, dtype=canvas.dtype)
+        return self._sample_tile(
+            model,
+            positive,
+            negative,
+            canvas,
+            noise,
+            noise_mask,
+            int(seed),
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            denoise,
+            False,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+        )
+
     def _run_redraw(
         self,
         模型,
@@ -1454,11 +1497,33 @@ class L13ContextMaskedRedraw8K:
         disable_noise = add_noise == "disable"
         force_full_denoise = leftover_noise == "disable"
         scale = _vae_scale(VAE)
+        input_latent_pixels = None
+        if isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
+            latent_samples = comfy.sample.fix_empty_latent_channels(模型, 输入潜空间["samples"])
+            if 参考图像 is None:
+                native_denoise = 1.0 if 高级采样器逻辑 else float(重绘强度)
+                latent_samples = self._sample_native_reference_latent(
+                    模型,
+                    正向条件,
+                    负向条件,
+                    latent_samples,
+                    噪声种子,
+                    总步数,
+                    CFG引导,
+                    采样器,
+                    调度器,
+                    native_denoise,
+                    disable_noise=disable_noise,
+                    start_step=起始步,
+                    last_step=结束步,
+                    force_full_denoise=force_full_denoise,
+                )
+            input_latent_pixels = _vae_decode_latent(VAE, latent_samples)
+
         reference_pixels = 参考图像
         if reference_pixels is None:
-            if isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
-                latent_samples = comfy.sample.fix_empty_latent_channels(模型, 输入潜空间["samples"])
-                reference_pixels = _vae_decode_latent(VAE, latent_samples)
+            if input_latent_pixels is not None:
+                reference_pixels = input_latent_pixels
             else:
                 raise RuntimeError("L13 参考重绘放大需要连接 参考图像；如果不接参考图像，则必须连接不带噪的 输入潜空间 作为参考来源。")
 
@@ -1528,8 +1593,8 @@ class L13ContextMaskedRedraw8K:
         decay = float(递进强度衰减)
 
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
-            if stage_index == 0 and isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
-                base = self._build_canvas_from_latent(模型, 输入潜空间, stage_width, stage_height, scale, allow_resize=True)
+            if stage_index == 0 and input_latent_pixels is not None:
+                base = self._build_canvas_from_pixels(VAE, input_latent_pixels, stage_width, stage_height, 图像缩放算法)
             else:
                 base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
@@ -1814,7 +1879,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         return {
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
-                "VAE": ("VAE", {"tooltip": "用于编码参考图像、解码 clean latent 兜底参考，以及 8K tiled VAE encode/decode。"}),
+                "VAE": ("VAE", {"tooltip": "用于编码参考图像、解码输入潜空间，以及 8K tiled VAE encode/decode。"}),
                 "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
                 "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
                 "总步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "完整采样时间线的总步数。高级分段时每一段都填同一个总步数。"}),
@@ -1829,10 +1894,10 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
             },
             "optional": {
+                "参考图像": ("IMAGE", {"tooltip": "可选。若连接，始终作为参考来源；若未连接，会先按原尺寸采样 输入潜空间，再解码成参考图像后放大。"}),
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
-                "输入潜空间": ("LATENT", {"tooltip": "可选。若同时接参考图像，则 latent 作为起始画布直接缩放，参考图像仍作为参考来源；若未接参考图像，则会解码此 latent 作为参考图像，此时必须是不带噪的 clean latent。"}),
-                "参考图像": ("IMAGE", {"tooltip": "可选但优先级最高。连接后必须作为参考来源；输入潜空间只作为可选起始 latent 画布。未连接时才会解码 输入潜空间 作为参考图像。"}),
+                "输入潜空间": ("LATENT", {"tooltip": "可选。若未接参考图像，会先按原尺寸跑一遍采样，再解码为参考图像并放大；若已接参考图像，则只会先解码成图像，再按图像路径缩放重编码。"}),
             }
         }
 

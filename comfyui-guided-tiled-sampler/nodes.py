@@ -352,13 +352,14 @@ def _blend_reference_latent(samples: torch.Tensor, reference: torch.Tensor, stre
 
 
 class _CanvasProgress:
-    def __init__(self, model, total_steps: int, preview_mode: str):
+    def __init__(self, model, total_steps: int, preview_mode: str, vae=None):
         self.total = max(1, int(total_steps))
         self.completed = 0
         self.tile_start = 0
         self.tile_steps = 1
         self.preview_mode = preview_mode
         self.pbar = comfy.utils.ProgressBar(self.total)
+        self.vae = vae
         self.previewer = None
         self.last_preview = None
         if preview_mode != "关闭":
@@ -378,11 +379,34 @@ class _CanvasProgress:
 
         return callback
 
+    def _vae_preview_image(self, latent: torch.Tensor):
+        if self.vae is None:
+            return None
+        scale = _vae_scale(self.vae)
+        max_latent = max(1, 512 // max(1, scale))
+        preview_latent = latent[:1].detach()
+        latent_h = int(preview_latent.shape[-2])
+        latent_w = int(preview_latent.shape[-1])
+        if max(latent_h, latent_w) > max_latent:
+            if latent_w >= latent_h:
+                out_w = max_latent
+                out_h = max(1, int(round(max_latent * latent_h / latent_w)))
+            else:
+                out_h = max_latent
+                out_w = max(1, int(round(max_latent * latent_w / latent_h)))
+            preview_latent = comfy.utils.common_upscale(preview_latent, out_w, out_h, "bilinear", "disabled")
+        pixels = self.vae.decode(preview_latent)
+        return latent_preview.preview_to_image(pixels[0, :, :, :3], do_scale=False)
+
     def capture_preview(self, latent: torch.Tensor):
-        if self.previewer is None or self.preview_mode == "关闭":
+        if self.preview_mode == "关闭":
             return
         try:
-            self.last_preview = self.previewer.decode_latent_to_preview_image("JPEG", latent)
+            image = self._vae_preview_image(latent)
+            if image is not None:
+                self.last_preview = ("JPEG", image, 512)
+            elif self.previewer is not None:
+                self.last_preview = self.previewer.decode_latent_to_preview_image("JPEG", latent)
         except Exception as exc:
             logging.warning("L13 stable preview failed and will be disabled: %s", exc)
             self.previewer = None
@@ -1012,7 +1036,7 @@ class L13ContextMaskedRedraw8K:
             raise RuntimeError(f"L13 局部重绘预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
 
         sampler_steps = _effective_sampler_steps(总步数, 起始步, 结束步)
-        progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率)
+        progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率, VAE)
         current_pixels = 参考图像
         canvas = None
         stage_count = len(stage_plans)

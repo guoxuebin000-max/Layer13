@@ -23,33 +23,6 @@ PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
-L13_ADVANCED_INPUT_NAMES = [
-    "目标宽度",
-    "目标高度",
-    "递进强度衰减",
-    "重绘强度",
-    "细节扰动",
-    "分块宽度",
-    "分块高度",
-    "重叠像素",
-    "上下文像素",
-    "采样缓冲像素",
-    "融合方式",
-    "图像缩放算法",
-    "重绘轮数",
-    "分块顺序",
-    "预览频率",
-    "最大分块数",
-    "色彩稳定强度",
-    "参考保留强度",
-    "主体重绘上限",
-    "背景重绘倍率",
-    "主体判断阈值",
-    "接缝修复",
-    "接缝修复强度",
-    "接缝宽度",
-    "主体保护强度",
-]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
@@ -110,16 +83,6 @@ def _param(kwargs: Dict, *names: str, default=_MISSING):
     if default is not _MISSING:
         return default
     raise KeyError(f"Missing node input. Expected one of: {', '.join(names)}")
-
-
-def _mark_advanced_inputs(input_types: Dict, names: Sequence[str]) -> Dict:
-    for section in ("required", "optional"):
-        for name in names:
-            value = input_types.get(section, {}).get(name)
-            if not isinstance(value, tuple) or len(value) < 2 or not isinstance(value[1], dict):
-                continue
-            value[1]["advanced"] = True
-    return input_types
 
 
 def _target_pixels_with_long_edge(samples: torch.Tensor, long_edge: int) -> Tuple[int, int]:
@@ -1134,7 +1097,7 @@ class L13ContextMaskedRedraw8K:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return _mark_advanced_inputs({
+        return {
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。第二段会用同一模型在高分辨率 latent 上做 masked img2img。"}),
                 "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
@@ -1149,38 +1112,13 @@ class L13ContextMaskedRedraw8K:
                 "参数预设": (cls.redraw_presets, {"default": "自定义", "tooltip": "运行时安全预设。自定义完全按参数跑；人物稳定/人物细节会限制高 CFG、高重绘和高扰动；背景/建筑会更偏向纹理和线条。"}),
                 "人物安全模式": (cls.enable_modes, {"default": "启用", "tooltip": "启用后，在人物预设或连接主体遮罩时自动限制主体 tile 的重绘强度和细节扰动，降低重复主体、换脸和发灰风险。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
-                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
-                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
-                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时重绘强度的乘数。0.85 表示越接近最终尺寸越保守；关闭递进时忽略。"}),
-                "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。人物 8K 建议 0.12-0.22，背景可到 0.30-0.35。"}),
-                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
-                "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
-                "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
-                "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
-                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
-                "采样缓冲像素": ("INT", {"default": 96, "min": 0, "max": 2048, "step": 8, "tooltip": "在中心写回区外额外允许采样的一圈 halo。halo 会参与 denoise 但不会写回全图，用来减少 tile 边缘被 mask 截断。"}),
-                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
-                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
-                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
-                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会使用 K采样器同款 latent 预览，逐步显示当前 context tile；每轮只在一整轮结束时更新；关闭只显示进度。"}),
-                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
-                "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
-                "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "当主体遮罩在 tile 中占比较高时，实际重绘强度不会超过这个值。用于防止人物主体被二次生成。"}),
-                "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 会把重绘强度乘以该倍率，让背景比主体更容易长细节。"}),
-                "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时，当前 tile 按主体 tile 处理并应用主体重绘上限。"}),
-                "接缝修复": (["禁用", "启用"], {"tooltip": "启用后在最终阶段额外跑一轮低强度 seam pass，只处理 tile 边界附近，帮助统一接缝纹理。"}),
-                "接缝修复强度": ("FLOAT", {"default": 0.06, "min": 0.01, "max": 0.5, "step": 0.01, "round": 0.001, "tooltip": "接缝修复 pass 的 denoise。它只负责统一边界，不负责新增主体细节，建议 0.04-0.08。"}),
-                "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
-                "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
             }
-        }, L13_ADVANCED_INPUT_NAMES)
+        }
 
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("samples",)
@@ -1587,30 +1525,30 @@ class L13ContextMaskedRedraw8K:
         参数预设,
         人物安全模式,
         目标规格,
-        目标宽度,
-        目标高度,
         递进放大模式,
-        递进强度衰减,
-        重绘强度,
-        细节扰动,
-        分块宽度,
-        分块高度,
-        重叠像素,
-        上下文像素,
-        采样缓冲像素,
-        融合方式,
-        图像缩放算法,
-        重绘轮数,
-        分块顺序,
-        最大分块数,
-        色彩稳定强度,
-        参考保留强度,
-        主体重绘上限,
-        背景重绘倍率,
-        主体判断阈值,
-        接缝修复,
-        接缝修复强度,
-        接缝宽度,
+        目标宽度=8192,
+        目标高度=8192,
+        递进强度衰减=0.85,
+        重绘强度=0.22,
+        细节扰动=0.0,
+        分块宽度=1280,
+        分块高度=1280,
+        重叠像素=256,
+        上下文像素=512,
+        采样缓冲像素=96,
+        融合方式="余弦",
+        图像缩放算法="lanczos",
+        重绘轮数=1,
+        分块顺序="顺序",
+        最大分块数=4096,
+        色彩稳定强度=0.0,
+        参考保留强度=0.06,
+        主体重绘上限=0.14,
+        背景重绘倍率=1.25,
+        主体判断阈值=0.18,
+        接缝修复="禁用",
+        接缝修复强度=0.06,
+        接缝宽度=96,
         预览频率="每个分块",
         高级参数=None,
         主体保护遮罩=None,
@@ -1667,7 +1605,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
 
     @classmethod
     def INPUT_TYPES(cls):
-        return _mark_advanced_inputs({
+        return {
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
                 "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
@@ -1686,38 +1624,13 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
-                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
-                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
-                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时重绘强度的乘数。0.85 表示越接近最终尺寸越保守；关闭递进时忽略。"}),
-                "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。高级分段继续跑时可用 1.0；参考图局部细化人物建议 0.12-0.22。"}),
-                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
-                "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
-                "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
-                "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
-                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
-                "采样缓冲像素": ("INT", {"default": 96, "min": 0, "max": 2048, "step": 8, "tooltip": "在中心写回区外额外允许采样的一圈 halo。halo 会参与 denoise 但不会写回全图，用来减少 tile 边缘被 mask 截断。"}),
-                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
-                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
-                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
-                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会使用 K采样器同款 latent 预览，逐步显示当前 context tile；每轮只在一整轮结束时更新；关闭只显示进度。"}),
-                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
-                "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数。当前只会小幅增加参考保留，不再做 latent 均值方差匹配；建议保持 0。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出，用于保留原图质感和局部对比。过高会降低新细节，人物建议 0.04-0.12。"}),
-                "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "当主体遮罩在 tile 中占比较高时，实际重绘强度不会超过这个值。用于防止人物主体被二次生成。"}),
-                "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 会把重绘强度乘以该倍率，让背景比主体更容易长细节。"}),
-                "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时，当前 tile 按主体 tile 处理并应用主体重绘上限。"}),
-                "接缝修复": (["禁用", "启用"], {"tooltip": "启用后在最终阶段额外跑一轮低强度 seam pass，只处理 tile 边界附近，帮助统一接缝纹理。"}),
-                "接缝修复强度": ("FLOAT", {"default": 0.06, "min": 0.01, "max": 0.5, "step": 0.01, "round": 0.001, "tooltip": "接缝修复 pass 的 denoise。它只负责统一边界，不负责新增主体细节，建议 0.04-0.08。"}),
-                "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。设为 0 或关闭接缝修复时不运行 seam pass。"}),
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
-                "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
             }
-        }, L13_ADVANCED_INPUT_NAMES)
+        }
 
     DESCRIPTION = "KSampler Advanced style reference-anchored context masked redraw pass for 4K/8K latent canvases."
 
@@ -1740,30 +1653,30 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         结束步,
         保留剩余噪声,
         目标规格,
-        目标宽度,
-        目标高度,
         递进放大模式,
-        递进强度衰减,
-        重绘强度,
-        细节扰动,
-        分块宽度,
-        分块高度,
-        重叠像素,
-        上下文像素,
-        采样缓冲像素,
-        融合方式,
-        图像缩放算法,
-        重绘轮数,
-        分块顺序,
-        最大分块数,
-        色彩稳定强度,
-        参考保留强度,
-        主体重绘上限,
-        背景重绘倍率,
-        主体判断阈值,
-        接缝修复,
-        接缝修复强度,
-        接缝宽度,
+        目标宽度=8192,
+        目标高度=8192,
+        递进强度衰减=0.85,
+        重绘强度=0.22,
+        细节扰动=0.0,
+        分块宽度=1280,
+        分块高度=1280,
+        重叠像素=256,
+        上下文像素=512,
+        采样缓冲像素=96,
+        融合方式="余弦",
+        图像缩放算法="lanczos",
+        重绘轮数=1,
+        分块顺序="顺序",
+        最大分块数=4096,
+        色彩稳定强度=0.0,
+        参考保留强度=0.06,
+        主体重绘上限=0.14,
+        背景重绘倍率=1.25,
+        主体判断阈值=0.18,
+        接缝修复="禁用",
+        接缝修复强度=0.06,
+        接缝宽度=96,
         预览频率="每个分块",
         高级参数=None,
         主体保护遮罩=None,

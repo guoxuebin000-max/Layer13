@@ -61,7 +61,7 @@ Recommended人物 8K defaults:
 
 The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
 
-The main `L13 参考重绘放大` nodes keep only the workflow-level controls visible and mark size/tile/detail controls as advanced. If you want a cleaner graph or want to share the same advanced settings between normal and advanced nodes, add `L13 参考重绘放大参数` and connect its `高级参数` output to the main node. Connected `高级参数` overrides the folded advanced controls on the main node, including custom width/height, redraw denoise, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+The main `L13 参考重绘放大` nodes only declare workflow-level controls. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, redraw denoise, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 

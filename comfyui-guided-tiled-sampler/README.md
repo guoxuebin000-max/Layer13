@@ -46,12 +46,16 @@ Recommended人物 8K defaults:
 - `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质
 - `递进放大模式`: `平衡1024阶梯` for人物 4K/8K; use `快速2倍` for背景 when speed matters.
 - `递进强度衰减`: `0.85`
+- `色彩稳定强度`: `0.75`
+- `参考保留强度`: `0.08 - 0.18` for人物, lower it if the redraw becomes too conservative.
 
 The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives a stable preview only after the current tile segment finishes sampling. Intermediate `x0` previews are suppressed because masked tile sampling can briefly produce stripe artifacts during early sampler steps.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 
 `递进放大模式` creates intermediate canvases before the final size. For example, a 1024px source targeting 4K with `平衡1024阶梯` runs approximately `2048 -> 3072 -> 4096`. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
+
+`色彩稳定强度` matches each sampled tile's latent mean and contrast back to the reference tile before blending. `参考保留强度` mixes a small amount of the reference latent back into the sampled tile. Together they reduce gray/desaturated results and help keep the pre-upscale texture.
 
 ## L13 Advanced Context Redraw
 

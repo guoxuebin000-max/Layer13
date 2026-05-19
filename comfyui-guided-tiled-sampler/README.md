@@ -36,8 +36,11 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 
 Recommended人物 8K defaults:
 
+- `目标规格`: `4K` by default; switch to `8K` after the 4K settings are stable.
+- `总步数`: `10`
 - `重绘强度`: `0.12 - 0.22`
-- `CFG引导`: `3.5 - 5.0`
+- `CFG引导`: `1.0` by default for reference-anchored redraw; raise only if the prompt is too weak.
+- `采样器` / `调度器`: `euler` / `ddim_uniform`
 - `分块宽度` / `分块高度`: `1024 - 1536`
 - `重叠像素`: `192 - 256`
 - `上下文像素`: `384 - 512`
@@ -60,7 +63,7 @@ The progress bar advances by sampler step across all progressive stages, passes,
 
 `采样缓冲像素` separates the sampled area from the written area. Each tile now samples `write core + sample halo` inside the larger context crop, but only writes the original center tile back to the full latent canvas. This reduces hard mask edges while keeping context read-only.
 
-`主体保护遮罩` now does two jobs. It still softens the noise mask inside protected areas, and it also enables adaptive tile denoise: subject-heavy tiles are capped by `主体重绘上限`, while low-subject tiles may use `背景重绘倍率` to add more background texture. `人物安全模式` applies extra runtime caps for人物 presets or when a subject mask is connected.
+`主体保护遮罩` now does two jobs. It still softens the noise mask inside protected areas, and it also enables adaptive tile denoise: subject-heavy tiles are capped by `主体重绘上限`, while low-subject tiles may use `背景重绘倍率` to add more background texture. `主体重绘上限` is not a second global denoise value; it only applies when a subject mask is connected and the current tile contains enough subject pixels. `人物安全模式` applies extra runtime caps for人物 presets or when a subject mask is connected.
 
 `接缝修复` runs only on the final stage. It creates a seam mask along tile boundaries and performs one low-denoise masked redraw pass there, then writes only the seam areas back with the normal feather accumulation. Keep it off unless visible seams remain.
 

@@ -5,6 +5,7 @@ from io import BytesIO
 from typing import Any
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageOps
 import folder_paths
 from aiohttp import web
@@ -66,6 +67,107 @@ def _load_image_as_tensor(path: str) -> torch.Tensor:
     return torch.from_numpy(array).unsqueeze(0)
 
 
+def _normalize_image_batch(
+    images: list[torch.Tensor],
+    size_mode: str,
+    fit_mode: str,
+    width: int,
+    height: int,
+    background_color: str,
+) -> torch.Tensor:
+    if not images:
+        raise ValueError("图像批次为空")
+
+    sizes = [(int(image.shape[2]), int(image.shape[1])) for image in images]
+
+    if size_mode == "保持原尺寸":
+        if len(set(sizes)) != 1:
+            size_text = ", ".join(f"{w}x{h}" for w, h in sizes)
+            raise ValueError(f"保持原尺寸要求所有图片同宽同高，当前尺寸: {size_text}")
+        target_w, target_h = sizes[0]
+    elif size_mode == "最小尺寸":
+        target_w = min(w for w, _ in sizes)
+        target_h = min(h for _, h in sizes)
+    elif size_mode == "最大尺寸":
+        target_w = max(w for w, _ in sizes)
+        target_h = max(h for _, h in sizes)
+    elif size_mode == "自定义尺寸":
+        target_w = max(1, int(width))
+        target_h = max(1, int(height))
+    else:
+        target_w, target_h = sizes[0]
+
+    normalized = [_fit_image_tensor(image, target_w, target_h, fit_mode, background_color) for image in images]
+    return torch.cat(normalized, dim=0)
+
+
+def _parse_rgb(color_text: str, fallback=(0, 0, 0)) -> tuple[float, float, float]:
+    s = str(color_text or "").strip()
+    if s.startswith("#"):
+        s = s[1:]
+    try:
+        if len(s) == 6:
+            return (
+                int(s[0:2], 16) / 255.0,
+                int(s[2:4], 16) / 255.0,
+                int(s[4:6], 16) / 255.0,
+            )
+        if len(s) == 3:
+            return (
+                int(s[0] * 2, 16) / 255.0,
+                int(s[1] * 2, 16) / 255.0,
+                int(s[2] * 2, 16) / 255.0,
+            )
+    except Exception:
+        pass
+    return tuple(float(v) / 255.0 for v in fallback)
+
+
+def _fit_image_tensor(image: torch.Tensor, target_w: int, target_h: int, fit_mode: str, background_color: str) -> torch.Tensor:
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError("输入图像必须是 IMAGE 张量，形状为 (1,H,W,C)")
+
+    src_h = int(image.shape[1])
+    src_w = int(image.shape[2])
+    if src_w == target_w and src_h == target_h:
+        return image
+
+    x = image.permute(0, 3, 1, 2)
+    src_ratio = float(src_w) / float(src_h)
+    dst_ratio = float(target_w) / float(target_h)
+
+    if fit_mode == "填充":
+        out = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False, antialias=True)
+        return out.permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
+    if fit_mode == "裁剪":
+        if src_ratio > dst_ratio:
+            crop_w = max(1, int(round(src_h * dst_ratio)))
+            left = max(0, (src_w - crop_w) // 2)
+            x = x[:, :, :, left:left + crop_w]
+        else:
+            crop_h = max(1, int(round(src_w / dst_ratio)))
+            top = max(0, (src_h - crop_h) // 2)
+            x = x[:, :, top:top + crop_h, :]
+        out = F.interpolate(x, size=(target_h, target_w), mode="bicubic", align_corners=False, antialias=True)
+        return out.permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
+    if src_ratio > dst_ratio:
+        fit_w = target_w
+        fit_h = max(1, int(round(target_w / src_ratio)))
+    else:
+        fit_h = target_h
+        fit_w = max(1, int(round(target_h * src_ratio)))
+
+    resized = F.interpolate(x, size=(fit_h, fit_w), mode="bicubic", align_corners=False, antialias=True)
+    bg = torch.tensor(_parse_rgb(background_color), dtype=image.dtype, device=image.device).view(1, 3, 1, 1)
+    canvas = bg.expand(1, 3, target_h, target_w).clone()
+    paste_x = max(0, (target_w - fit_w) // 2)
+    paste_y = max(0, (target_h - fit_h) // 2)
+    canvas[:, :, paste_y:paste_y + fit_h, paste_x:paste_x + fit_w] = resized
+    return canvas.permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
+
 if PromptServer is not None:
     @PromptServer.instance.routes.get("/layer13/thumb")
     async def layer13_thumb(request):
@@ -112,28 +214,35 @@ if PromptServer is not None:
         except Exception as exc:
             return web.Response(status=500, text=f"thumb generation failed: {exc}")
 
-
 class Layer13MultiImageInput:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "文件列表JSON": ("STRING", {"default": "[]", "multiline": True}),
+                "批次尺寸": (["第一张尺寸", "保持原尺寸", "最小尺寸", "最大尺寸", "自定义尺寸"], {"default": "第一张尺寸"}),
+                "适应方式": (["适应", "裁剪", "填充"], {"default": "适应"}),
+                "自定义宽度": ("INT", {"default": 1024, "min": 1, "max": 16384, "step": 1}),
+                "自定义高度": ("INT", {"default": 1024, "min": 1, "max": 16384, "step": 1}),
+                "背景颜色": ("STRING", {"default": "#000000"}),
             }
         }
-    RETURN_TYPES = (LAYER13_IMAGE_LIST_TYPE, "INT", "STRING")
-    RETURN_NAMES = ("图像列表", "数量", "文件名列表")
+    RETURN_TYPES = (LAYER13_IMAGE_LIST_TYPE, "INT", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("图像列表", "数量", "文件名列表", "图像批次", "图像逐张列表")
+    OUTPUT_IS_LIST = (False, False, False, False, True)
     FUNCTION = "加载"
     CATEGORY = "Layer13"
-    def 加载(self, 文件列表JSON="[]"):
+    def 加载(self, 文件列表JSON="[]", 批次尺寸="第一张尺寸", 适应方式="适应", 自定义宽度=1024, 自定义高度=1024, 背景颜色="#000000"):
         items = _parse_file_list(文件列表JSON)
         if not items:
             raise ValueError("请先在节点里选择至少一张图片")
         output_items: list[dict[str, Any]] = []
+        image_tensors: list[torch.Tensor] = []
         labels: list[str] = []
         for item in items:
             path = _resolve_input_path(item)
             tensor = _load_image_as_tensor(path)
+            image_tensors.append(tensor)
             output_items.append(
                 {
                     "image": tensor,
@@ -145,9 +254,18 @@ class Layer13MultiImageInput:
                 }
             )
             labels.append(item["label"])
-        return (output_items, len(output_items), "\n".join(labels))
+        batch = _normalize_image_batch(image_tensors, 批次尺寸, 适应方式, 自定义宽度, 自定义高度, 背景颜色)
+        return (output_items, len(output_items), "\n".join(labels), batch, image_tensors)
     @classmethod
-    def IS_CHANGED(cls, 文件列表JSON="[]"):
+    def IS_CHANGED(
+        cls,
+        文件列表JSON="[]",
+        批次尺寸="第一张尺寸",
+        适应方式="适应",
+        自定义宽度=1024,
+        自定义高度=1024,
+        背景颜色="#000000",
+    ):
         try:
             items = _parse_file_list(文件列表JSON)
         except Exception:
@@ -159,13 +277,23 @@ class Layer13MultiImageInput:
                 fingerprints.append(f"{item['label']}:{os.path.getmtime(path)}:{os.path.getsize(path)}")
             except Exception:
                 fingerprints.append(item["label"])
-        return "|".join(fingerprints)
+        return "|".join(fingerprints + [str(批次尺寸), str(适应方式), str(自定义宽度), str(自定义高度), str(背景颜色)])
     @classmethod
-    def VALIDATE_INPUTS(cls, 文件列表JSON="[]"):
+    def VALIDATE_INPUTS(
+        cls,
+        文件列表JSON="[]",
+        批次尺寸="第一张尺寸",
+        适应方式="适应",
+        自定义宽度=1024,
+        自定义高度=1024,
+        背景颜色="#000000",
+    ):
         try:
             _parse_file_list(文件列表JSON)
         except Exception as exc:
             return str(exc)
+        if 批次尺寸 == "自定义尺寸" and (int(自定义宽度) < 1 or int(自定义高度) < 1):
+            return "自定义宽度和自定义高度必须大于 0"
         return True
 class Layer13ImageListGetByIndex:
     @classmethod
@@ -332,8 +460,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Layer13MultiImageInput": "Layer13多图导入",
-    "Layer13ImageListGetByIndex": "Layer13按索引取图像列表",
-    "Layer13ManualImageLoader": "Layer13拖入加载图片",
-    "Layer13ImageListPick": "Layer13拖入取图",
+    "Layer13MultiImageInput": "layer13 多图导入",
+    "Layer13ImageListGetByIndex": "layer13 按索引取图像列表",
+    "Layer13ManualImageLoader": "layer13 拖入加载图片",
+    "Layer13ImageListPick": "layer13 拖入取图",
 }

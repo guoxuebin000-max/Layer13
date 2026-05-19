@@ -1,0 +1,1145 @@
+import logging
+import math
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+
+import comfy.sample
+import comfy.samplers
+import comfy.utils
+import latent_preview
+
+
+MAX_RESOLUTION = 16384
+_MISSING = object()
+
+ADD_NOISE_CHOICES = ["启用", "禁用"]
+LEFTOVER_NOISE_CHOICES = ["禁用", "启用"]
+BLEND_CHOICES = ["余弦", "线性", "高斯"]
+TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
+REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
+TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
+PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
+TARGET_SIZE_LONG_EDGE = {
+    "自定义": None,
+    "4K": 4096,
+    "8K": 8192,
+}
+
+ADD_NOISE_MAP = {
+    "启用": "enable",
+    "禁用": "disable",
+    "enable": "enable",
+    "disable": "disable",
+}
+LEFTOVER_NOISE_MAP = {
+    "启用": "enable",
+    "禁用": "disable",
+    "enable": "enable",
+    "disable": "disable",
+}
+BLEND_MAP = {
+    "余弦": "cosine",
+    "线性": "linear",
+    "高斯": "gaussian",
+    "cosine": "cosine",
+    "linear": "linear",
+    "gaussian": "gaussian",
+}
+REFERENCE_MODE_MAP = {
+    "潜空间缩放": "latent",
+    "图像重编码": "image",
+    "latent": "latent",
+    "image": "image",
+}
+
+
+def _latent_dim(pixel_dim: int) -> int:
+    return max(1, int(pixel_dim) // 8)
+
+
+def _round_pixel_dim(pixel_dim: int) -> int:
+    return max(8, int(pixel_dim) - int(pixel_dim) % 8)
+
+
+def _round_pixel_dim_nearest(pixel_dim: float) -> int:
+    return max(8, int(round(float(pixel_dim) / 8.0)) * 8)
+
+
+def _param(kwargs: Dict, *names: str, default=_MISSING):
+    for name in names:
+        if name in kwargs:
+            return kwargs[name]
+    if default is not _MISSING:
+        return default
+    raise KeyError(f"Missing node input. Expected one of: {', '.join(names)}")
+
+
+def _target_pixels_with_long_edge(samples: torch.Tensor, long_edge: int) -> Tuple[int, int]:
+    latent_h = max(1, int(samples.shape[-2]))
+    latent_w = max(1, int(samples.shape[-1]))
+    if latent_w >= latent_h:
+        width = long_edge
+        height = _round_pixel_dim_nearest(long_edge * latent_h / latent_w)
+    else:
+        width = _round_pixel_dim_nearest(long_edge * latent_w / latent_h)
+        height = long_edge
+
+    return min(width, MAX_RESOLUTION), min(height, MAX_RESOLUTION)
+
+
+def _target_pixels_from_latent_ratio(samples: torch.Tensor, target_size: str, custom_width: int, custom_height: int) -> Tuple[int, int]:
+    long_edge = TARGET_SIZE_LONG_EDGE.get(target_size)
+    if long_edge is not None:
+        return _target_pixels_with_long_edge(samples, long_edge)
+
+    width = _round_pixel_dim(custom_width)
+    height = _round_pixel_dim(custom_height)
+    if width == height:
+        return _target_pixels_with_long_edge(samples, width)
+    return width, height
+
+
+def _round_to_multiple_nearest(value: float, multiple: int) -> int:
+    multiple = max(1, int(multiple))
+    return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+
+def _round_to_multiple_floor(value: int, multiple: int) -> int:
+    multiple = max(1, int(multiple))
+    return max(multiple, int(value) - int(value) % multiple)
+
+
+def _vae_scale(vae) -> int:
+    if hasattr(vae, "spacial_compression_encode"):
+        scale = vae.spacial_compression_encode()
+    else:
+        scale = getattr(vae, "downscale_ratio", 8)
+        if isinstance(scale, tuple):
+            scale = scale[-1]
+    if not isinstance(scale, int):
+        scale = 8
+    return max(1, scale)
+
+
+def _target_pixels_from_image_ratio(pixels: torch.Tensor, target_size: str, custom_width: int, custom_height: int, scale: int) -> Tuple[int, int]:
+    image_h = max(1, int(pixels.shape[1]))
+    image_w = max(1, int(pixels.shape[2]))
+    long_edge = TARGET_SIZE_LONG_EDGE.get(target_size)
+    if long_edge is not None:
+        if image_w >= image_h:
+            width = _round_to_multiple_nearest(long_edge, scale)
+            height = _round_to_multiple_nearest(long_edge * image_h / image_w, scale)
+        else:
+            width = _round_to_multiple_nearest(long_edge * image_w / image_h, scale)
+            height = _round_to_multiple_nearest(long_edge, scale)
+        return min(width, MAX_RESOLUTION), min(height, MAX_RESOLUTION)
+
+    width = _round_to_multiple_floor(custom_width, scale)
+    height = _round_to_multiple_floor(custom_height, scale)
+    if width == height:
+        if image_w >= image_h:
+            return width, _round_to_multiple_nearest(width * image_h / image_w, scale)
+        return _round_to_multiple_nearest(height * image_w / image_h, scale), height
+    return width, height
+
+
+def _scale_pixels(pixels: torch.Tensor, width: int, height: int, method: str) -> torch.Tensor:
+    pixels = pixels[:, :, :, :3]
+    scaled = comfy.utils.common_upscale(pixels.movedim(-1, 1), width, height, method, "disabled")
+    return scaled.movedim(1, -1)
+
+
+def _vae_encode_pixels(vae, pixels: torch.Tensor) -> torch.Tensor:
+    pixels = pixels[:, :, :, :3]
+    if max(int(pixels.shape[1]), int(pixels.shape[2])) >= 2048 and hasattr(vae, "encode_tiled"):
+        return vae.encode_tiled(pixels, tile_x=1024, tile_y=1024, overlap=128)
+    return vae.encode(pixels)
+
+
+def _ordered_tiles(tiles: List[Tuple[int, int, int, int]], height: int, width: int, mode: str) -> List[Tuple[int, int, int, int]]:
+    if mode == "中心向外":
+        cy = height / 2.0
+        cx = width / 2.0
+        return sorted(tiles, key=lambda r: (((r[0] + r[1]) / 2.0 - cy) ** 2 + ((r[2] + r[3]) / 2.0 - cx) ** 2))
+    if mode == "蛇形":
+        rows: Dict[int, List[Tuple[int, int, int, int]]] = {}
+        for tile in tiles:
+            rows.setdefault(tile[0], []).append(tile)
+        ordered = []
+        for i, y in enumerate(sorted(rows)):
+            row = sorted(rows[y], key=lambda r: r[2], reverse=bool(i % 2))
+            ordered.extend(row)
+        return ordered
+    return tiles
+
+
+def _scale_mask(mask: torch.Tensor, width: int, height: int, device, dtype) -> torch.Tensor:
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    mask = mask.unsqueeze(1).to(device=device, dtype=dtype)
+    return comfy.utils.common_upscale(mask, width, height, "bilinear", "disabled").clamp(0.0, 1.0)
+
+
+def _tile_positions(length: int, tile: int, overlap: int) -> List[int]:
+    tile = max(1, min(tile, length))
+    if tile >= length:
+        return [0]
+    stride = max(1, tile - overlap)
+    positions = list(range(0, max(1, length - tile + 1), stride))
+    last = length - tile
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+def _tile_grid(height: int, width: int, tile_h: int, tile_w: int, overlap: int) -> List[Tuple[int, int, int, int]]:
+    ys = _tile_positions(height, tile_h, overlap)
+    xs = _tile_positions(width, tile_w, overlap)
+    return [(y, min(y + tile_h, height), x, min(x + tile_w, width)) for y in ys for x in xs]
+
+
+def _edge_ramp(n: int, mode: str, device, dtype) -> torch.Tensor:
+    if n <= 0:
+        return torch.ones(0, device=device, dtype=dtype)
+    t = torch.linspace(0.0, 1.0, n + 2, device=device, dtype=dtype)[1:-1]
+    if mode == "linear":
+        return t
+    if mode == "gaussian":
+        sigma = 0.38
+        return torch.exp(-0.5 * ((1.0 - t) / sigma) ** 2).clamp_min(1e-3)
+    return 0.5 - 0.5 * torch.cos(t * math.pi)
+
+
+def _tile_weight(
+    tile_h: int,
+    tile_w: int,
+    full_h: int,
+    full_w: int,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    overlap: int,
+    mode: str,
+    device,
+    dtype,
+) -> torch.Tensor:
+    wy = torch.ones(tile_h, device=device, dtype=dtype)
+    wx = torch.ones(tile_w, device=device, dtype=dtype)
+    oy = min(max(0, overlap), max(0, tile_h // 2))
+    ox = min(max(0, overlap), max(0, tile_w // 2))
+    if oy > 0:
+        ramp = _edge_ramp(oy, mode, device, dtype)
+        if y0 > 0:
+            wy[:oy] = ramp
+        if y1 < full_h:
+            wy[-oy:] = torch.flip(ramp, dims=[0])
+    if ox > 0:
+        ramp = _edge_ramp(ox, mode, device, dtype)
+        if x0 > 0:
+            wx[:ox] = ramp
+        if x1 < full_w:
+            wx[-ox:] = torch.flip(ramp, dims=[0])
+    return (wy[:, None] * wx[None, :]).unsqueeze(0).unsqueeze(0)
+
+
+def _normalize_detail_noise(noise: torch.Tensor) -> torch.Tensor:
+    if noise.ndim != 4:
+        return noise
+    if noise.shape[-2] > 2 and noise.shape[-1] > 2:
+        low = torch.nn.functional.avg_pool2d(noise, kernel_size=3, stride=1, padding=1)
+        noise = noise - low
+    reduce_dims = tuple(range(1, noise.ndim))
+    std = noise.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
+    return noise / std
+
+
+class _CanvasProgress:
+    def __init__(self, model, total: int, preview_mode: str):
+        self.total = max(1, int(total))
+        self.current = 0
+        self.preview_mode = preview_mode
+        self.pbar = comfy.utils.ProgressBar(self.total)
+        self.previewer = None
+        self.last_preview = None
+        if preview_mode != "关闭":
+            try:
+                self.previewer = latent_preview.get_previewer(model.load_device, model.model.latent_format)
+            except Exception as exc:
+                logging.warning("L13 KSampler-style previewer could not be initialized: %s", exc)
+
+    def tile_callback(self):
+        if self.previewer is None:
+            return None
+        preview_format = "JPEG"
+
+        def callback(step, x0, x, total_steps):
+            try:
+                self.last_preview = self.previewer.decode_latent_to_preview_image(preview_format, x0)
+            except Exception as exc:
+                logging.warning("L13 KSampler-style preview failed and will be disabled: %s", exc)
+                self.previewer = None
+                self.last_preview = None
+
+        return callback
+
+    def update(self, force_preview: bool = False):
+        self.current = min(self.current + 1, self.total)
+        preview = None
+        if self.preview_mode == "每个分块" or force_preview:
+            preview = self.last_preview
+        self.pbar.update_absolute(self.current, self.total, preview)
+
+
+def _crop_mask(mask: torch.Tensor, y0: int, y1: int, x0: int, x1: int) -> torch.Tensor:
+    if mask.ndim < 2:
+        return mask
+    return mask[..., y0:y1, x0:x1]
+
+
+def _intersect_area(area: Sequence[int], y0: int, y1: int, x0: int, x1: int) -> Optional[Tuple[int, int, int, int]]:
+    if len(area) < 4:
+        return None
+    h, w, y, x = int(area[0]), int(area[1]), int(area[2]), int(area[3])
+    iy0 = max(y, y0)
+    ix0 = max(x, x0)
+    iy1 = min(y + h, y1)
+    ix1 = min(x + w, x1)
+    if iy1 <= iy0 or ix1 <= ix0:
+        return None
+    return (iy1 - iy0, ix1 - ix0, iy0 - y0, ix0 - x0)
+
+
+def _tile_conditioning(conds: Optional[List[Dict]], y0: int, y1: int, x0: int, x1: int) -> Optional[List[Dict]]:
+    if conds is None:
+        return None
+    out = []
+    for cond in conds:
+        modified = cond.copy()
+        if "area" in modified:
+            local_area = _intersect_area(modified["area"], y0, y1, x0, x1)
+            if local_area is None:
+                continue
+            modified["area"] = local_area
+        if "mask" in modified:
+            modified["mask"] = _crop_mask(modified["mask"], y0, y1, x0, x1)
+        out.append(modified)
+    return out
+
+
+class TiledCondBatch:
+    def __init__(
+        self,
+        tile_h: int,
+        tile_w: int,
+        overlap: int,
+        context: int,
+        blend: str,
+        max_tiles: int,
+        warn_controlnet: bool,
+    ):
+        self.tile_h = tile_h
+        self.tile_w = tile_w
+        self.overlap = overlap
+        self.context = context
+        self.blend = blend
+        self.max_tiles = max_tiles
+        self.warn_controlnet = warn_controlnet
+        self._warned_control = False
+
+    def _has_control(self, conds: Iterable[Optional[List[Dict]]]) -> bool:
+        for cond_list in conds:
+            if not cond_list:
+                continue
+            for cond in cond_list:
+                if "control" in cond:
+                    return True
+        return False
+
+    def __call__(self, args):
+        conds = args["conds"]
+        x = args["input"]
+        sigma = args["sigma"]
+        model = args["model"]
+        model_options = args["model_options"]
+
+        if x.ndim != 4:
+            return comfy.samplers.calc_cond_batch(model, conds, x, sigma, model_options)
+
+        _, _, height, width = x.shape
+        tile_h = max(1, min(self.tile_h, height))
+        tile_w = max(1, min(self.tile_w, width))
+        overlap = max(0, min(self.overlap, tile_h - 1, tile_w - 1))
+        context = max(0, min(self.context, height - 1, width - 1))
+        tiles = _tile_grid(height, width, tile_h, tile_w, overlap)
+
+        if self.max_tiles > 0 and len(tiles) > self.max_tiles:
+            raise RuntimeError(
+                f"Guided Tiled KSampler would run {len(tiles)} tiles per denoise call; "
+                f"max_tiles is {self.max_tiles}. Increase max_tiles or use larger tile size."
+            )
+
+        if len(tiles) == 1:
+            tile_options = model_options.copy()
+            tile_options.pop("sampler_calc_cond_batch_function", None)
+            return comfy.samplers.calc_cond_batch(model, conds, x, sigma, tile_options)
+
+        if self.warn_controlnet and not self._warned_control and self._has_control(conds):
+            logging.warning(
+                "Guided Tiled KSampler detected ControlNet conditioning. "
+                "The tiled sampler is intended for prompt/latent-guided 8K sampling; "
+                "ControlNet hints may not align exactly per tile."
+            )
+            self._warned_control = True
+
+        tile_options = model_options.copy()
+        tile_options.pop("sampler_calc_cond_batch_function", None)
+
+        accum = [torch.zeros_like(x) for _ in conds]
+        counts = torch.zeros((1, 1, height, width), device=x.device, dtype=x.dtype)
+
+        for y0, y1, x0, x1 in tiles:
+            cy0 = max(0, y0 - context)
+            cy1 = min(height, y1 + context)
+            cx0 = max(0, x0 - context)
+            cx1 = min(width, x1 + context)
+            x_tile = x[:, :, cy0:cy1, cx0:cx1]
+            tile_conds = [_tile_conditioning(c, cy0, cy1, cx0, cx1) for c in conds]
+            tile_out = comfy.samplers.calc_cond_batch(model, tile_conds, x_tile, sigma, tile_options)
+            oy0 = y0 - cy0
+            oy1 = oy0 + (y1 - y0)
+            ox0 = x0 - cx0
+            ox1 = ox0 + (x1 - x0)
+            weight = _tile_weight(
+                y1 - y0,
+                x1 - x0,
+                height,
+                width,
+                y0,
+                y1,
+                x0,
+                x1,
+                overlap,
+                self.blend,
+                x.device,
+                x.dtype,
+            )
+            counts[:, :, y0:y1, x0:x1] += weight
+            for i, out in enumerate(tile_out):
+                accum[i][:, :, y0:y1, x0:x1] += out[:, :, oy0:oy1, ox0:ox1] * weight
+
+        counts = counts.clamp_min(torch.finfo(x.dtype).eps if x.dtype.is_floating_point else 1e-6)
+        return [out / counts for out in accum]
+
+
+class GuidedTiledKSampler8K:
+    upscale_methods = ["bislerp", "bicubic", "bilinear", "nearest-exact", "area"]
+    blend_modes = BLEND_CHOICES
+    add_noise_modes = ADD_NOISE_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "模型": ("MODEL", {"tooltip": "用于分块去噪采样的扩散模型。"}),
+                "正向条件": ("CONDITIONING", {"tooltip": "正向提示词条件，描述画面中希望出现的内容。"}),
+                "负向条件": ("CONDITIONING", {"tooltip": "负向提示词条件，描述需要避免的内容。"}),
+                "构图潜空间": ("LATENT", {"tooltip": "第一段低分辨率构图结果。节点会把它缩放到目标尺寸的潜空间后再分块采样。"}),
+                "随机种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成噪声用的种子。相同种子和参数会尽量复现同样结果。"}),
+                "总步数": ("INT", {"default": 28, "min": 1, "max": 10000, "tooltip": "第二段 8K 分块采样使用的总去噪步数。"}),
+                "CFG引导": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "提示词引导强度。数值越高越贴提示词，过高可能破坏画面。"}),
+                "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "采样算法。建议先保持和第一段构图采样器一致。"}),
+                "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "噪声调度方式。建议先保持和第一段构图调度器一致。"}),
+                "参考来源": (REFERENCE_MODE_CHOICES, {"tooltip": "潜空间缩放会直接放大 latent；图像重编码会先用 VAE 解码构图图像、缩放到目标尺寸、再编码回 latent，通常更稳。"}),
+                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 4K/8K 时，会把原 latent 长边变成 4096/8192，短边按原比例自动计算。"}),
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
+                "重绘强度": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "参考构图潜空间的强度。0.45-0.65 通常比较稳，越高越容易改变构图。"}),
+                "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "每个采样块的像素宽度。越大一致性越好，但显存占用越高。"}),
+                "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "每个采样块的像素高度。越大一致性越好，但显存占用越高。"}),
+                "重叠像素": ("INT", {"default": 192, "min": 0, "max": 2048, "step": 8, "tooltip": "相邻分块的重叠区域。建议 192-256，用来减少接缝。"}),
+                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每块采样时额外向四周读取的上下文，只把中心块写回。值越大越能参考周围内容，但显存占用越高。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "重叠区域的融合曲线。余弦通常最稳，线性更直接，高斯边缘更柔。"}),
+                "构图缩放算法": (cls.upscale_methods, {"tooltip": "把低分辨率构图潜空间缩放到目标潜空间时使用的算法。bislerp 通常适合 latent。"}),
+                "图像缩放算法": (["lanczos", "bicubic", "bilinear", "nearest-exact", "area"], {"tooltip": "参考来源为图像重编码时使用。先缩放第一段图像，再 VAE 编码回目标 latent。"}),
+                "加噪": (cls.add_noise_modes, {"tooltip": "是否在本节点开始时加入随机噪声。参考完整构图再重绘时通常启用；接高级分段后半段时通常禁用。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计分块数超过此值会报错，0 表示不限制。"}),
+            },
+            "optional": {
+                "VAE": ("VAE", {"tooltip": "参考来源为图像重编码时需要。未连接参考图像时，会用这个 VAE 解码构图潜空间再重编码。"}),
+                "参考图像": ("IMAGE", {"tooltip": "可选。若连接，则图像重编码会直接使用这张第一段完成图作为参考，而不是解码构图潜空间。"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "sample"
+    CATEGORY = "sampling/guided_tiled"
+    DESCRIPTION = (
+        "Creates a target-size latent from a low-resolution composition latent and samples it by "
+        "running every denoise step in overlapping tiles. This is tiled sampling, not image upscaling."
+    )
+
+    def _prepare_target_latent(
+        self,
+        model,
+        composition_latent,
+        target_size,
+        target_width,
+        target_height,
+        guide_upscale,
+        reference_mode,
+        image_upscale,
+        vae=None,
+        reference_image=None,
+    ):
+        samples = composition_latent["samples"]
+        target_width, target_height = _target_pixels_from_latent_ratio(samples, target_size, target_width, target_height)
+        latent_w = _latent_dim(target_width)
+        latent_h = _latent_dim(target_height)
+
+        latent_format = model.get_model_object("latent_format")
+        channels = getattr(latent_format, "latent_channels", samples.shape[1])
+        if samples.shape[1] != channels:
+            if samples.shape[1] == 1:
+                samples = samples.repeat(1, channels, 1, 1)
+            else:
+                raise RuntimeError(f"Composition latent has {samples.shape[1]} channels; model expects {channels}.")
+
+        if reference_mode == "image":
+            if vae is None:
+                raise RuntimeError("参考来源为图像重编码时必须连接 VAE。")
+            pixels = reference_image
+            if pixels is None:
+                pixels = vae.decode(samples)
+            pixels = _scale_pixels(pixels, target_width, target_height, image_upscale)
+            samples = _vae_encode_pixels(vae, pixels)
+        elif samples.shape[-2:] != (latent_h, latent_w):
+            samples = comfy.utils.common_upscale(samples, latent_w, latent_h, guide_upscale, "disabled")
+
+        out = composition_latent.copy()
+        out["samples"] = samples
+        return out
+
+    def _sample_tiled(
+        self,
+        model,
+        positive,
+        negative,
+        input_latent,
+        noise_seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        target_size,
+        target_width,
+        target_height,
+        denoise,
+        tile_width,
+        tile_height,
+        overlap,
+        context,
+        blend,
+        guide_upscale,
+        reference_mode,
+        image_upscale,
+        add_noise,
+        max_tiles,
+        start_step=None,
+        last_step=None,
+        force_full_denoise=False,
+        vae=None,
+        reference_image=None,
+    ):
+        target_latent = self._prepare_target_latent(
+            model,
+            input_latent,
+            target_size,
+            target_width,
+            target_height,
+            guide_upscale,
+            reference_mode,
+            image_upscale,
+            vae=vae,
+            reference_image=reference_image,
+        )
+        latent_image = comfy.sample.fix_empty_latent_channels(model, target_latent["samples"])
+        target_latent["samples"] = latent_image
+
+        disable_noise = add_noise == "disable"
+        if disable_noise:
+            noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+        else:
+            batch_inds = target_latent.get("batch_index")
+            noise = comfy.sample.prepare_noise(latent_image, noise_seed, batch_inds)
+
+        noise_mask = target_latent.get("noise_mask")
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        tiled_model = model.clone()
+        tiled_model.set_model_sampler_calc_cond_batch_function(
+            TiledCondBatch(
+                tile_h=_latent_dim(tile_height),
+                tile_w=_latent_dim(tile_width),
+                overlap=_latent_dim(overlap),
+                context=_latent_dim(context),
+                blend=blend,
+                max_tiles=max_tiles,
+                warn_controlnet=True,
+            )
+        )
+
+        samples = comfy.sample.sample(
+            tiled_model,
+            noise,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+            noise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=noise_seed,
+        )
+
+        out = target_latent.copy()
+        out["samples"] = samples
+        return (out,)
+
+    def sample(self, **kwargs):
+        add_noise = ADD_NOISE_MAP[_param(kwargs, "加噪", "add_noise")]
+        blend = BLEND_MAP[_param(kwargs, "融合方式", "blend")]
+        reference_mode = REFERENCE_MODE_MAP[_param(kwargs, "参考来源", "reference_mode", default="潜空间缩放")]
+        return self._sample_tiled(
+            _param(kwargs, "模型", "model"),
+            _param(kwargs, "正向条件", "positive"),
+            _param(kwargs, "负向条件", "negative"),
+            _param(kwargs, "构图潜空间", "composition_latent"),
+            _param(kwargs, "随机种子", "seed"),
+            _param(kwargs, "总步数", "steps"),
+            _param(kwargs, "CFG引导", "cfg"),
+            _param(kwargs, "采样器", "sampler_name"),
+            _param(kwargs, "调度器", "scheduler"),
+            _param(kwargs, "目标规格", "target_size", default="自定义"),
+            _param(kwargs, "目标宽度", "target_width"),
+            _param(kwargs, "目标高度", "target_height"),
+            _param(kwargs, "重绘强度", "denoise"),
+            _param(kwargs, "分块宽度", "tile_width"),
+            _param(kwargs, "分块高度", "tile_height"),
+            _param(kwargs, "重叠像素", "overlap"),
+            _param(kwargs, "上下文像素", "context", default=0),
+            blend,
+            _param(kwargs, "构图缩放算法", "guide_upscale"),
+            reference_mode,
+            _param(kwargs, "图像缩放算法", "image_upscale", default="lanczos"),
+            add_noise,
+            _param(kwargs, "最大分块数", "max_tiles"),
+            vae=_param(kwargs, "VAE", "vae", default=None),
+            reference_image=_param(kwargs, "参考图像", "reference_image", default=None),
+        )
+
+
+class GuidedTiledKSamplerAdvanced8K(GuidedTiledKSampler8K):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "模型": ("MODEL", {"tooltip": "用于分块去噪采样的扩散模型。"}),
+                "加噪": (cls.add_noise_modes, {"tooltip": "是否在本节点开始时加入随机噪声。接第一段剩余噪声继续采样时通常设为禁用。"}),
+                "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成噪声用的种子。高级分段流程中需和第一段保持一致。"}),
+                "总步数": ("INT", {"default": 30, "min": 1, "max": 10000, "tooltip": "完整采样时间线的总步数。第一段和第二段必须填同一个总步数。"}),
+                "CFG引导": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "提示词引导强度。建议和第一段保持一致。"}),
+                "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "采样算法。高级分段流程中需和第一段保持一致。"}),
+                "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "噪声调度方式。高级分段流程中需和第一段保持一致。"}),
+                "正向条件": ("CONDITIONING", {"tooltip": "正向提示词条件，描述画面中希望出现的内容。"}),
+                "负向条件": ("CONDITIONING", {"tooltip": "负向提示词条件，描述需要避免的内容。"}),
+                "输入潜空间": ("LATENT", {"tooltip": "上一段输出的潜空间。可以接低分辨率完整构图，也可以接高级采样第一段的 leftover latent。"}),
+                "起始步": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "本节点从完整采样时间线的第几步开始。接 0->3 的第一段时这里填 3。"}),
+                "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本节点采样到第几步结束。通常填总步数，例如 30。"}),
+                "保留剩余噪声": (LEFTOVER_NOISE_CHOICES, {"tooltip": "启用表示输出仍保留未采完的噪声，方便继续分段；最终输出通常设为禁用。"}),
+                "参考来源": (REFERENCE_MODE_CHOICES, {"tooltip": "潜空间缩放会直接放大 latent；图像重编码会先用 VAE 解码参考图像、缩放到目标尺寸、再编码回 latent。高级分段接力通常保持潜空间缩放。"}),
+                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 4K/8K 时，会把原 latent 长边变成 4096/8192，短边按原比例自动计算。"}),
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
+                "重绘强度": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级分段接力通常填 1.0；参考完整构图再重绘时可用 0.45-0.65。"}),
+                "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "每个采样块的像素宽度。越大一致性越好，但显存占用越高。"}),
+                "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "每个采样块的像素高度。越大一致性越好，但显存占用越高。"}),
+                "重叠像素": ("INT", {"default": 192, "min": 0, "max": 2048, "step": 8, "tooltip": "相邻分块的重叠区域。建议 192-256，用来减少接缝。"}),
+                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每块采样时额外向四周读取的上下文，只把中心块写回。值越大越能参考周围内容，但显存占用越高。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "重叠区域的融合曲线。余弦通常最稳，线性更直接，高斯边缘更柔。"}),
+                "构图缩放算法": (cls.upscale_methods, {"tooltip": "把输入潜空间缩放到目标潜空间时使用的算法。bislerp 通常适合 latent。"}),
+                "图像缩放算法": (["lanczos", "bicubic", "bilinear", "nearest-exact", "area"], {"tooltip": "参考来源为图像重编码时使用。先缩放第一段图像，再 VAE 编码回目标 latent。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计分块数超过此值会报错，0 表示不限制。"}),
+            },
+            "optional": {
+                "VAE": ("VAE", {"tooltip": "参考来源为图像重编码时需要。未连接参考图像时，会用这个 VAE 解码输入潜空间再重编码。"}),
+                "参考图像": ("IMAGE", {"tooltip": "可选。若连接，则图像重编码会直接使用这张第一段完成图作为参考，而不是解码输入潜空间。"}),
+            }
+        }
+
+    DESCRIPTION = (
+        "KSampler Advanced style tiled sampling. Use start/end steps to resume a low-resolution "
+        "composition pass at target size with overlapping tiled denoise calls."
+    )
+
+    def sample(self, **kwargs):
+        add_noise = ADD_NOISE_MAP[_param(kwargs, "加噪", "add_noise")]
+        blend = BLEND_MAP[_param(kwargs, "融合方式", "blend")]
+        reference_mode = REFERENCE_MODE_MAP[_param(kwargs, "参考来源", "reference_mode", default="潜空间缩放")]
+        leftover_noise = LEFTOVER_NOISE_MAP[_param(kwargs, "保留剩余噪声", "return_with_leftover_noise")]
+        force_full_denoise = leftover_noise == "disable"
+        return self._sample_tiled(
+            _param(kwargs, "模型", "model"),
+            _param(kwargs, "正向条件", "positive"),
+            _param(kwargs, "负向条件", "negative"),
+            _param(kwargs, "输入潜空间", "latent_image"),
+            _param(kwargs, "噪声种子", "noise_seed"),
+            _param(kwargs, "总步数", "steps"),
+            _param(kwargs, "CFG引导", "cfg"),
+            _param(kwargs, "采样器", "sampler_name"),
+            _param(kwargs, "调度器", "scheduler"),
+            _param(kwargs, "目标规格", "target_size", default="自定义"),
+            _param(kwargs, "目标宽度", "target_width"),
+            _param(kwargs, "目标高度", "target_height"),
+            _param(kwargs, "重绘强度", "denoise"),
+            _param(kwargs, "分块宽度", "tile_width"),
+            _param(kwargs, "分块高度", "tile_height"),
+            _param(kwargs, "重叠像素", "overlap"),
+            _param(kwargs, "上下文像素", "context", default=0),
+            blend,
+            _param(kwargs, "构图缩放算法", "guide_upscale"),
+            reference_mode,
+            _param(kwargs, "图像缩放算法", "image_upscale", default="lanczos"),
+            add_noise,
+            _param(kwargs, "最大分块数", "max_tiles"),
+            start_step=_param(kwargs, "起始步", "start_at_step"),
+            last_step=_param(kwargs, "结束步", "end_at_step"),
+            force_full_denoise=force_full_denoise,
+            vae=_param(kwargs, "VAE", "vae", default=None),
+            reference_image=_param(kwargs, "参考图像", "reference_image", default=None),
+        )
+
+
+class L13ContextMaskedRedraw8K:
+    blend_modes = BLEND_CHOICES
+    tile_orders = TILE_ORDER_CHOICES
+    target_sizes = TARGET_SIZE_CHOICES
+    image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。第二段会用同一模型在高分辨率 latent 上做 masked img2img。"}),
+                "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
+                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。节点会把它按原比例缩放到 4K/8K，再 VAE 编码为高分辨率画布。"}),
+                "正向条件": ("CONDITIONING", {"tooltip": "第二段使用的正向提示词。可以和第一段相同，但建议 CFG 和重绘强度更低。"}),
+                "负向条件": ("CONDITIONING", {"tooltip": "第二段使用的负向提示词。节点不会改写提示词，建议手动加入 duplicate / collage 等负向词。"}),
+                "随机种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。每个 tile 从同一张噪声图裁切，避免 tile 独立随机。"}),
+                "总步数": ("INT", {"default": 16, "min": 1, "max": 10000, "tooltip": "每个局部重绘 tile 的采样步数。人物图建议 12-20。"}),
+                "CFG引导": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段，通常 3.5-5.5。"}),
+                "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "局部重绘使用的采样器。建议先用 dpmpp_2m_sde_gpu / dpmpp_3m_sde_gpu / euler。"}),
+                "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "局部重绘使用的调度器。建议和第一段一致或使用 karras。"}),
+                "目标规格": (cls.target_sizes, {"tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。人物 8K 建议 0.12-0.22，背景可到 0.30-0.35。"}),
+                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
+                "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
+                "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
+                "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
+                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
+                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
+                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
+                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会像局部细化节点一样显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
+            },
+            "optional": {
+                "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
+                "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "sample"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "Reference-anchored context-aware masked img2img redraw pass for 4K/8K latent canvases."
+
+    def _build_canvas(self, vae, reference_image, target_size, target_width, target_height, image_upscale):
+        scale = _vae_scale(vae)
+        target_width, target_height = _target_pixels_from_image_ratio(reference_image, target_size, target_width, target_height, scale)
+        pixels = _scale_pixels(reference_image, target_width, target_height, image_upscale)
+        samples = _vae_encode_pixels(vae, pixels)
+        return samples
+
+    def _sample_tile(
+        self,
+        model,
+        positive,
+        negative,
+        context_latent,
+        context_noise,
+        noise_mask,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        disable_pbar,
+        disable_noise=False,
+        start_step=None,
+        last_step=None,
+        force_full_denoise=False,
+        callback=None,
+    ):
+        return comfy.sample.sample(
+            model,
+            context_noise,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            context_latent,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+            noise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=seed,
+        )
+
+    def _run_redraw(
+        self,
+        模型,
+        VAE,
+        参考图像,
+        正向条件,
+        负向条件,
+        噪声种子,
+        总步数,
+        CFG引导,
+        采样器,
+        调度器,
+        目标规格,
+        目标宽度,
+        目标高度,
+        重绘强度,
+        细节扰动,
+        分块宽度,
+        分块高度,
+        重叠像素,
+        上下文像素,
+        融合方式,
+        图像缩放算法,
+        重绘轮数,
+        分块顺序,
+        最大分块数,
+        预览频率="每个分块",
+        加噪="启用",
+        起始步=None,
+        结束步=None,
+        保留剩余噪声="禁用",
+        主体保护遮罩=None,
+        主体保护强度=0.55,
+    ):
+        blend = BLEND_MAP[融合方式]
+        add_noise = ADD_NOISE_MAP[加噪]
+        leftover_noise = LEFTOVER_NOISE_MAP[保留剩余噪声]
+        disable_noise = add_noise == "disable"
+        force_full_denoise = leftover_noise == "disable"
+        base = self._build_canvas(VAE, 参考图像, 目标规格, 目标宽度, 目标高度, 图像缩放算法)
+        base = comfy.sample.fix_empty_latent_channels(模型, base)
+        canvas = base.clone()
+
+        _, _, height, width = canvas.shape
+        scale = _vae_scale(VAE)
+        tile_h = max(1, min(_round_to_multiple_floor(分块高度, scale) // scale, height))
+        tile_w = max(1, min(_round_to_multiple_floor(分块宽度, scale) // scale, width))
+        overlap = max(0, min(_round_to_multiple_floor(重叠像素, scale) // scale, tile_h - 1, tile_w - 1))
+        context = max(0, _round_to_multiple_floor(上下文像素, scale) // scale)
+        tiles = _ordered_tiles(_tile_grid(height, width, tile_h, tile_w, overlap), height, width, 分块顺序)
+
+        total_tile_runs = len(tiles) * max(1, int(重绘轮数))
+        if 最大分块数 > 0 and total_tile_runs > 最大分块数:
+            raise RuntimeError(f"L13 局部重绘预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
+
+        if disable_noise:
+            global_noise = torch.zeros(canvas.size(), dtype=canvas.dtype, layout=canvas.layout, device="cpu")
+        else:
+            global_noise = comfy.sample.prepare_noise(canvas, int(噪声种子), None)
+        detail_noise = None
+        if float(细节扰动) > 0:
+            detail_seed = (int(噪声种子) + 0x9E3779B97F4A7C15) & 0xffffffffffffffff
+            detail_noise = _normalize_detail_noise(comfy.sample.prepare_noise(canvas, detail_seed, None))
+
+        protect_mask = None
+        if 主体保护遮罩 is not None:
+            protect_mask = _scale_mask(主体保护遮罩, width, height, canvas.device, canvas.dtype)
+            protect_mask = protect_mask.clamp(0.0, 1.0)
+
+        progress = _CanvasProgress(模型, total_tile_runs, 预览频率)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        for pass_index in range(max(1, int(重绘轮数))):
+            accum = torch.zeros_like(canvas)
+            weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
+
+            for tile_index, (y0, y1, x0, x1) in enumerate(tiles):
+                cy0 = max(0, y0 - context)
+                cy1 = min(height, y1 + context)
+                cx0 = max(0, x0 - context)
+                cx1 = min(width, x1 + context)
+                iy0 = y0 - cy0
+                iy1 = iy0 + (y1 - y0)
+                ix0 = x0 - cx0
+                ix1 = ix0 + (x1 - x0)
+
+                context_latent = canvas[:, :, cy0:cy1, cx0:cx1].clone()
+                context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
+                noise_mask = torch.zeros((canvas.shape[0], 1, cy1 - cy0, cx1 - cx0), device=canvas.device, dtype=canvas.dtype)
+                noise_mask[:, :, iy0:iy1, ix0:ix1] = 1.0
+                if protect_mask is not None and 主体保护强度 > 0:
+                    local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1]
+                    noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
+                if detail_noise is not None:
+                    local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
+                    context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
+
+                out_context = self._sample_tile(
+                    模型,
+                    正向条件,
+                    负向条件,
+                    context_latent,
+                    context_noise,
+                    noise_mask,
+                    int(噪声种子),
+                    总步数,
+                    CFG引导,
+                    采样器,
+                    调度器,
+                    重绘强度,
+                    disable_pbar,
+                    disable_noise=disable_noise,
+                    start_step=起始步,
+                    last_step=结束步,
+                    force_full_denoise=force_full_denoise,
+                    callback=progress.tile_callback(),
+                )
+                out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
+                weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
+                accum[:, :, y0:y1, x0:x1] += out_tile * weight
+                weights[:, :, y0:y1, x0:x1] += weight
+                progress.update(force_preview=(预览频率 == "每轮" and tile_index == len(tiles) - 1))
+
+            canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
+
+        return ({"samples": canvas},)
+
+    def sample(
+        self,
+        模型,
+        VAE,
+        参考图像,
+        正向条件,
+        负向条件,
+        随机种子,
+        总步数,
+        CFG引导,
+        采样器,
+        调度器,
+        目标规格,
+        目标宽度,
+        目标高度,
+        重绘强度,
+        细节扰动,
+        分块宽度,
+        分块高度,
+        重叠像素,
+        上下文像素,
+        融合方式,
+        图像缩放算法,
+        重绘轮数,
+        分块顺序,
+        最大分块数,
+        预览频率="每个分块",
+        主体保护遮罩=None,
+        主体保护强度=0.55,
+    ):
+        return self._run_redraw(
+            模型,
+            VAE,
+            参考图像,
+            正向条件,
+            负向条件,
+            随机种子,
+            总步数,
+            CFG引导,
+            采样器,
+            调度器,
+            目标规格,
+            目标宽度,
+            目标高度,
+            重绘强度,
+            细节扰动,
+            分块宽度,
+            分块高度,
+            重叠像素,
+            上下文像素,
+            融合方式,
+            图像缩放算法,
+            重绘轮数,
+            分块顺序,
+            最大分块数,
+            预览频率=预览频率,
+            主体保护遮罩=主体保护遮罩,
+            主体保护强度=主体保护强度,
+        )
+
+
+class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
+    add_noise_modes = ADD_NOISE_CHOICES
+    leftover_noise_modes = LEFTOVER_NOISE_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
+                "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
+                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。高级版仍以参考图像为全局锚点，不做自由分块 txt2img。"}),
+                "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
+                "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
+                "总步数": ("INT", {"default": 16, "min": 1, "max": 10000, "tooltip": "完整采样时间线的总步数。高级分段时每一段都填同一个总步数。"}),
+                "CFG引导": ("FLOAT", {"default": 4.5, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段，通常 3.5-5.5。"}),
+                "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "局部重绘使用的采样器。分段采样时各段应保持一致。"}),
+                "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "局部重绘使用的调度器。分段采样时各段应保持一致。"}),
+                "正向条件": ("CONDITIONING", {"tooltip": "第二段使用的正向提示词。可以和第一段相同，但不要用过高 CFG。"}),
+                "负向条件": ("CONDITIONING", {"tooltip": "第二段使用的负向提示词。建议加入 duplicate person、collage、split image 等负向词。"}),
+                "起始步": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "本段从完整采样时间线的第几步开始。比如先构图 3 步后，这里填 3。"}),
+                "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
+                "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
+                "目标规格": (cls.target_sizes, {"tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
+                "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
+                "重绘强度": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "masked img2img denoise。高级分段继续跑时可用 1.0；参考图局部细化人物建议 0.12-0.22。"}),
+                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动，用来激活局部纹理随机性。默认关闭；人物建议 0.01-0.04，背景可试 0.03-0.08。"}),
+                "分块宽度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。人物 8K 建议 1024-1536。"}),
+                "分块高度": ("INT", {"default": 1280, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。人物 8K 建议 1024-1536。"}),
+                "重叠像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。重叠越大越不容易有接缝，但更慢。"}),
+                "上下文像素": ("INT", {"default": 512, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图。"}),
+                "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。余弦通常最稳。"}),
+                "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。lanczos 通常更适合参考图。"}),
+                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1；背景可尝试 2。"}),
+                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。累积融合下影响较小；中心向外更适合主体图观察进度。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"tooltip": "运行时预览更新频率。每个分块会显示当前段落结果；每轮只在一整轮结束时更新；关闭只显示进度。"}),
+                "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
+            },
+            "optional": {
+                "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
+                "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。0 不保护，1 表示白色遮罩区域几乎不重绘。"}),
+            }
+        }
+
+    DESCRIPTION = "KSampler Advanced style reference-anchored context masked redraw pass for 4K/8K latent canvases."
+
+    def sample(
+        self,
+        模型,
+        VAE,
+        参考图像,
+        加噪,
+        噪声种子,
+        总步数,
+        CFG引导,
+        采样器,
+        调度器,
+        正向条件,
+        负向条件,
+        起始步,
+        结束步,
+        保留剩余噪声,
+        目标规格,
+        目标宽度,
+        目标高度,
+        重绘强度,
+        细节扰动,
+        分块宽度,
+        分块高度,
+        重叠像素,
+        上下文像素,
+        融合方式,
+        图像缩放算法,
+        重绘轮数,
+        分块顺序,
+        最大分块数,
+        预览频率="每个分块",
+        主体保护遮罩=None,
+        主体保护强度=0.55,
+    ):
+        return self._run_redraw(
+            模型,
+            VAE,
+            参考图像,
+            正向条件,
+            负向条件,
+            噪声种子,
+            总步数,
+            CFG引导,
+            采样器,
+            调度器,
+            目标规格,
+            目标宽度,
+            目标高度,
+            重绘强度,
+            细节扰动,
+            分块宽度,
+            分块高度,
+            重叠像素,
+            上下文像素,
+            融合方式,
+            图像缩放算法,
+            重绘轮数,
+            分块顺序,
+            最大分块数,
+            预览频率=预览频率,
+            加噪=加噪,
+            起始步=起始步,
+            结束步=结束步,
+            保留剩余噪声=保留剩余噪声,
+            主体保护遮罩=主体保护遮罩,
+            主体保护强度=主体保护强度,
+        )
+
+
+NODE_CLASS_MAPPINGS = {
+    "Layer13GuidedTiledKSampler8K": GuidedTiledKSampler8K,
+    "Layer13GuidedTiledKSamplerAdvanced8K": GuidedTiledKSamplerAdvanced8K,
+    "Layer13ContextMaskedRedraw8K": L13ContextMaskedRedraw8K,
+    "Layer13ContextMaskedRedrawAdvanced8K": L13ContextMaskedRedrawAdvanced8K,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Layer13GuidedTiledKSampler8K": "Guided Tiled KSampler 8K (Layer13)",
+    "Layer13GuidedTiledKSamplerAdvanced8K": "Guided Tiled KSampler Advanced 8K (Layer13)",
+    "Layer13ContextMaskedRedraw8K": "L13 局部重绘 8K 采样器",
+    "Layer13ContextMaskedRedrawAdvanced8K": "L13 局部重绘 8K 高级采样器",
+}

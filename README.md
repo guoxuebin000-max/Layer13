@@ -3,7 +3,7 @@
 这个仓库汇总了 `Layer13` 相关的 `ComfyUI` 自定义节点，包含两部分：
 
 1. 当前主包 `layer13`
-2. 历史上已经放进仓库的独立节点目录
+2. 独立节点目录
 
 ## 当前主包 `layer13`
 
@@ -38,11 +38,22 @@
 
 ## 历史独立目录
 
-仓库中还保留了这些已经存在的独立目录：
+仓库中保留并同步这些独立目录：
 
 - `comfyui-photorealism-enhancer`：Layer13 照片增强
 - `comfyui-layer13-depth-of-field`：Layer13 真实景深（深度图）
 - `comfyui-jpg-convert`：Layer13 保存 JPG
+- `comfyui-guided-tiled-sampler`：L13 局部重绘 4K/8K 采样器
+- `comfyui-layer13-any-index-switch`
+- `comfyui-layer13-auto-crop-border`
+- `comfyui-layer13-dataset-tools`
+- `comfyui-layer13-force-black-level`
+- `comfyui-layer13-force-levels-fixed`
+- `comfyui-layer13-preview`
+- `comfyui-layer13-random-loader`
+- `comfyui-layer13-random-video-frame`
+- `comfyui-layer13-video-upload`
+- `layer13_crop_info_tools`
 
 ## 安装
 
@@ -82,12 +93,26 @@ git clone https://github.com/guoxuebin000-max/Layer13.git
 ## 当前主包源码文件
 
 - `__init__.py`
+- `layer13_apimart.py`
+- `layer13_audio_tools.py`
 - `layer13_for_loop_index.py`
+- `layer13_fullscreen_watermark.py`
 - `layer13_grid_from_batch.py`
 - `layer13_grid_split_to_batch.py`
+- `layer13_grok_prompt.py`
 - `layer13_histogram_limit.py`
+- `layer13_image_batch_append.py`
+- `layer13_image_compress.py`
+- `layer13_load_image_default.py`
+- `layer13_masked_color_match.py`
+- `layer13_masked_exposure.py`
+- `layer13_metadata_cleaner.py`
 - `layer13_multi_image_input.py`
+- `layer13_persistent_counter.py`
+- `layer13_phone_camera.py`
 - `layer13_random_loader_n.py`
+- `layer13_real_pixel_texture.py`
 - `layer13_scale_by_long_short_edge.py`
 - `layer13_text_join_n.py`
+- `layer13_text_loader.py`
 - `layer13_video_from_vhs.py`

@@ -349,23 +349,21 @@ class _CanvasProgress:
         self.tile_steps = max(1, int(expected_steps))
 
     def tile_callback(self):
-        preview_format = "JPEG"
-
         def callback(step, x0, x, total_steps):
-            preview = None
-            if self.previewer is not None:
-                try:
-                    self.last_preview = self.previewer.decode_latent_to_preview_image(preview_format, x0)
-                except Exception as exc:
-                    logging.warning("L13 KSampler-style preview failed and will be disabled: %s", exc)
-                    self.previewer = None
-                    self.last_preview = None
-                if self.preview_mode == "每个分块":
-                    preview = self.last_preview
             current = min(self.total, self.tile_start + max(1, int(step) + 1))
-            self.pbar.update_absolute(current, self.total, preview)
+            self.pbar.update_absolute(current, self.total, None)
 
         return callback
+
+    def capture_preview(self, latent: torch.Tensor):
+        if self.previewer is None or self.preview_mode == "关闭":
+            return
+        try:
+            self.last_preview = self.previewer.decode_latent_to_preview_image("JPEG", latent)
+        except Exception as exc:
+            logging.warning("L13 stable preview failed and will be disabled: %s", exc)
+            self.previewer = None
+            self.last_preview = None
 
     def finish_tile(self, actual_steps: Optional[int] = None, force_preview: bool = False):
         steps = self.tile_steps if actual_steps is None else max(1, int(actual_steps))
@@ -1061,7 +1059,9 @@ class L13ContextMaskedRedraw8K:
                         force_full_denoise=force_full_denoise,
                         callback=progress.tile_callback(),
                     )
-                    progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每轮" and tile_index == len(tiles) - 1))
+                    if 预览频率 == "每个分块":
+                        progress.capture_preview(out_context)
+                    progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每个分块"))
                     out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                     weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
                     accum[:, :, y0:y1, x0:x1] += out_tile * weight
@@ -1069,6 +1069,7 @@ class L13ContextMaskedRedraw8K:
 
                 canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
                 if 预览频率 == "每轮":
+                    progress.capture_preview(canvas)
                     progress.force_preview()
 
             if stage_index < stage_count - 1:

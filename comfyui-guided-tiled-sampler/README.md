@@ -47,7 +47,7 @@ Recommended人物 8K defaults:
 - `递进放大模式`: `平衡1024阶梯` for人物 4K/8K; use `快速2倍` for背景 when speed matters.
 - `递进强度衰减`: `0.85`
 
-The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style `x0` preview for the current tile segment while it is sampling, similar to a local detailer pass.
+The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives a stable preview only after the current tile segment finishes sampling. Intermediate `x0` previews are suppressed because masked tile sampling can briefly produce stripe artifacts during early sampler steps.
 
 `细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
 

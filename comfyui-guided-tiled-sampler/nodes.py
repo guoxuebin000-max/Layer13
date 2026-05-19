@@ -452,22 +452,26 @@ def _scale_mask(mask: torch.Tensor, width: int, height: int, device, dtype) -> t
     return comfy.utils.common_upscale(mask, width, height, "bilinear", "disabled").clamp(0.0, 1.0)
 
 
-def _tile_positions(length: int, tile: int, overlap: int) -> List[int]:
+def _tile_intervals(length: int, tile: int, overlap: int) -> List[Tuple[int, int]]:
     tile = max(1, min(tile, length))
     if tile >= length:
-        return [0]
+        return [(0, length)]
     stride = max(1, tile - overlap)
-    positions = list(range(0, max(1, length - tile + 1), stride))
-    last = length - tile
-    if positions[-1] != last:
-        positions.append(last)
-    return positions
+    starts = list(range(0, max(1, length - tile + 1), stride))
+    intervals = [(start, min(start + tile, length)) for start in starts]
+    if intervals[-1][1] < length:
+        uncovered_tail = length - intervals[-1][1]
+        if uncovered_tail <= max(0, overlap):
+            intervals[-1] = (intervals[-1][0], length)
+        else:
+            intervals.append((length - tile, length))
+    return intervals
 
 
 def _tile_grid(height: int, width: int, tile_h: int, tile_w: int, overlap: int) -> List[Tuple[int, int, int, int]]:
-    ys = _tile_positions(height, tile_h, overlap)
-    xs = _tile_positions(width, tile_w, overlap)
-    return [(y, min(y + tile_h, height), x, min(x + tile_w, width)) for y in ys for x in xs]
+    ys = _tile_intervals(height, tile_h, overlap)
+    xs = _tile_intervals(width, tile_w, overlap)
+    return [(y0, y1, x0, x1) for y0, y1 in ys for x0, x1 in xs]
 
 
 def _seam_mask_from_tiles(

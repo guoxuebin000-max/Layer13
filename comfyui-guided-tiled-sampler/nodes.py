@@ -1879,7 +1879,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         return {
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
-                "VAE": ("VAE", {"tooltip": "用于编码参考图像、解码输入潜空间，以及 8K tiled VAE encode/decode。"}),
+                "VAE": ("VAE", {"tooltip": "用于解码输入潜空间、把原尺寸结果编码成高分辨率 latent，以及 8K tiled VAE encode/decode。"}),
+                "输入潜空间": ("LATENT", {"tooltip": "必接。高级版会先按原尺寸跑当前起止步采样，再解码为参考图像并放大；不再提供参考图像输入。"}),
                 "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
                 "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
                 "总步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "完整采样时间线的总步数。高级分段时每一段都填同一个总步数。"}),
@@ -1894,10 +1895,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
             },
             "optional": {
-                "参考图像": ("IMAGE", {"tooltip": "可选。若连接，始终作为参考来源；若未连接，会先按原尺寸采样 输入潜空间，再解码成参考图像后放大。"}),
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
-                "输入潜空间": ("LATENT", {"tooltip": "可选。若未接参考图像，会先按原尺寸跑一遍采样，再解码为参考图像并放大；若已接参考图像，则只会先解码成图像，再按图像路径缩放重编码。"}),
             }
         }
 
@@ -1907,6 +1906,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         self,
         模型,
         VAE,
+        输入潜空间,
         加噪,
         噪声种子,
         总步数,
@@ -1945,13 +1945,11 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
-        输入潜空间=None,
-        参考图像=None,
     ):
         return self._run_redraw(
             模型,
             VAE,
-            参考图像,
+            None,
             正向条件,
             负向条件,
             噪声种子,

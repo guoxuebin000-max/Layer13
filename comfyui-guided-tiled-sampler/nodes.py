@@ -23,7 +23,7 @@ _REGION_PROMPT_STORE: Dict[str, Dict[str, Any]] = {}
 ADD_NOISE_CHOICES = ["启用", "禁用"]
 LEFTOVER_NOISE_CHOICES = ["禁用", "启用"]
 BLEND_CHOICES = ["余弦", "线性", "高斯"]
-TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
+TARGET_SIZE_CHOICES = ["自定义", "2K", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 TAIL_MERGE_RATIO = 0.45
@@ -41,6 +41,7 @@ REGION_BOX_FORMAT_CHOICES = ["自动", "x0y0x1y1", "xywh"]
 VISUAL_REGION_MODE_CHOICES = ["人物主体", "通用照片", "背景材质", "建筑空间"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
+    "2K": 2048,
     "4K": 4096,
     "8K": 8192,
 }
@@ -948,6 +949,17 @@ def _make_detail_residual_latent(canvas: torch.Tensor, base: torch.Tensor, kerne
         return torch.zeros_like(canvas)
 
 
+def _enhance_latent_detail_frequency(canvas: torch.Tensor, base: torch.Tensor, strength: float, kernel_size: int) -> torch.Tensor:
+    strength = max(0.0, min(0.35, float(strength)))
+    if strength <= 0.0:
+        return canvas
+    try:
+        detail_residual = _make_detail_residual_latent(canvas, base, kernel_size)
+        return (canvas + detail_residual * strength).to(device=canvas.device, dtype=canvas.dtype)
+    except Exception:
+        return canvas
+
+
 def _mask_to_output(mask: Optional[torch.Tensor], batch: int, height: int, width: int, mode: str, scale: int, device, dtype) -> torch.Tensor:
     if mask is None:
         out = torch.zeros((batch, 1, height, width), device=device, dtype=dtype)
@@ -1776,7 +1788,7 @@ class GuidedTiledKSampler8K:
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "采样算法。建议先保持和第一段构图采样器一致。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"tooltip": "噪声调度方式。建议先保持和第一段构图调度器一致。"}),
                 "参考来源": (REFERENCE_MODE_CHOICES, {"tooltip": "潜空间缩放会直接放大 latent；图像重编码会先用 VAE 解码构图图像、缩放到目标尺寸、再编码回 latent，通常更稳。"}),
-                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 4K/8K 时，会把原 latent 长边变成 4096/8192，短边按原比例自动计算。"}),
+                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 2K/4K/8K 时，会把原 latent 长边变成 2048/4096/8192，短边按原比例自动计算。"}),
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
                 "重绘强度": ("FLOAT", {"default": 0.65, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "参考构图潜空间的强度。0.45-0.65 通常比较稳，越高越容易改变构图。"}),
@@ -1993,7 +2005,7 @@ class GuidedTiledKSamplerAdvanced8K(GuidedTiledKSampler8K):
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本节点采样到第几步结束。通常填步数，例如 30。"}),
                 "保留剩余噪声": (LEFTOVER_NOISE_CHOICES, {"tooltip": "启用表示输出仍保留未采完的噪声，方便继续分段；最终输出通常设为禁用。"}),
                 "参考来源": (REFERENCE_MODE_CHOICES, {"tooltip": "潜空间缩放会直接放大 latent；图像重编码会先用 VAE 解码参考图像、缩放到目标尺寸、再编码回 latent。高级分段接力通常保持潜空间缩放。"}),
-                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 4K/8K 时，会把原 latent 长边变成 4096/8192，短边按原比例自动计算。"}),
+                "目标规格": (TARGET_SIZE_CHOICES, {"tooltip": "自定义时使用目标宽高。选择 2K/4K/8K 时，会把原 latent 长边变成 2048/4096/8192，短边按原比例自动计算。"}),
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若目标宽度和目标高度相等，例如 8192/8192，会把该值当成长边并保持原 latent 比例。"}),
                 "重绘强度": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级分段接力通常填 1.0；参考完整构图再重绘时可用 0.45-0.65。"}),
@@ -2070,7 +2082,7 @@ class L13ContextMaskedRedraw8K:
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。第二段会用同一模型在高分辨率 latent 上做 masked img2img。"}),
                 "VAE": ("VAE", {"tooltip": "用于把第一段参考图像编码成高分辨率 latent。8K 会自动使用 tiled VAE encode。"}),
-                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。节点会把它按原比例缩放到 4K/8K，再 VAE 编码为高分辨率画布。"}),
+                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。节点会把它按原比例缩放到 2K/4K/8K，再 VAE 编码为高分辨率画布。"}),
                 "正向条件": ("CONDITIONING", {"tooltip": "第二段使用的正向提示词。可以和第一段相同，但建议 CFG 和降噪更低。"}),
                 "负向条件": ("CONDITIONING", {"tooltip": "第二段使用的负向提示词。节点不会改写提示词，建议手动加入 duplicate / collage 等负向词。"}),
                 "随机种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。每个 tile 从同一张噪声图裁切，避免 tile 独立随机。"}),
@@ -2078,7 +2090,7 @@ class L13ContextMaskedRedraw8K:
                 "CFG引导": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段；低 CFG 更依赖参考图，不容易重复主体。"}),
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "局部重绘使用的采样器。默认 euler，稳定且预览直观。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"default": "ddim_uniform", "tooltip": "局部重绘使用的调度器。默认 ddim_uniform，适合低 CFG 参考图重绘。"}),
-                "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
+                "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "2K/4K/8K 会保持参考图原比例，把长边设为 2048/4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例；关闭则直接生成目标尺寸。"}),
                 "降噪": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "与 K采样器 denoise 同义。控制每个局部重绘 tile 的 img2img 去噪幅度；默认 0.22。"}),
             },
@@ -2101,7 +2113,7 @@ class L13ContextMaskedRedraw8K:
     )
     FUNCTION = "sample"
     CATEGORY = "sampling/l13_redraw"
-    DESCRIPTION = "Reference-anchored context-aware masked img2img redraw pass for 4K/8K latent canvases."
+    DESCRIPTION = "Reference-anchored context-aware masked img2img redraw pass for 2K/4K/8K latent canvases."
 
     def _build_canvas_from_pixels(self, vae, pixels, target_width, target_height, image_upscale):
         pixels = _scale_pixels(pixels, target_width, target_height, image_upscale)
@@ -2707,10 +2719,18 @@ class L13ContextMaskedRedraw8K:
             if stage_index < stage_count - 1:
                 current_pixels = _sharpen_pixels(_vae_decode_latent(VAE, canvas), 0.08, 3)
 
+        reference_canvas = base if base is not None else torch.zeros_like(canvas)
+        detail_boost = 0.0
+        if _uses_detail_noise(细节扰动, 细节噪声模式):
+            detail_boost = max(0.04, min(0.18, float(细节扰动) * 12.0))
+        detail_kernel = max(3, min(31, int(round(96 / max(1, scale)))))
+        if detail_kernel % 2 == 0:
+            detail_kernel = max(3, detail_kernel - 1)
+        canvas = _enhance_latent_detail_frequency(canvas, reference_canvas, detail_boost, detail_kernel)
+
         image = _vae_decode_latent(VAE, canvas)
-        image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
         final_latent = {"samples": canvas}
-        reference_latent = {"samples": base if base is not None else torch.zeros_like(canvas)}
+        reference_latent = {"samples": reference_canvas}
         detail_residual = _make_detail_residual_latent(canvas, reference_latent["samples"], int(细节差异尺度))
         detail_latent = {"samples": detail_residual}
 
@@ -2820,7 +2840,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "起始步": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "本段从完整采样时间线的第几步开始。比如先构图 3 步后，这里填 3。"}),
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
-                "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
+                "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "2K/4K/8K 会保持参考图原比例，把长边设为 2048/4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
             },
             "optional": {
@@ -2830,7 +2850,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             }
         }
 
-    DESCRIPTION = "KSampler Advanced style reference-anchored context masked redraw pass for 4K/8K latent canvases."
+    DESCRIPTION = "KSampler Advanced style reference-anchored context masked redraw pass for 2K/4K/8K latent canvases."
 
     def sample(self, **kwargs):
         return self._run_redraw(

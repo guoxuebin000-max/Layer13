@@ -42,7 +42,7 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 
 1. Generate a complete low-resolution reference image.
 2. Connect that image to `参考图像` and connect the matching `VAE`.
-3. Choose `目标规格 = 4K` or `8K`.
+3. Choose `目标规格 = 2K`, `4K`, or `8K`.
 4. The node scales the image to target size, VAE-encodes it into a high-resolution latent canvas, then redraws center tiles with context using `noise_mask`.
 5. The node outputs an internally decoded `图像`. Internal VAE encode/decode uses 1024px tiles with 128px overlap.
 
@@ -73,7 +73,7 @@ Preview is handled by ComfyUI's built-in sampler preview system. There is no nod
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, seam repair settings, detail residual scale, and output mask size.
 
-The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0.
+The `图像` output is decoded inside the node with tiled VAE decode. It no longer receives fixed-strength low-frequency color transfer, because that can flatten sampled texture.
 
 The normal and advanced redraw nodes now also expose internal self-use debug outputs after the first `图像` output:
 
@@ -83,7 +83,7 @@ The normal and advanced redraw nodes now also expose internal self-use debug out
 - `接缝遮罩`: the final-stage tile seam mask, generated even when seam repair is disabled; it is black when there is no seam.
 - `主体保护遮罩`: the final-stage subject protection mask after scaling; it is black when no subject mask is connected.
 
-These latent outputs are for L13 follow-up processing and debugging. They are not recommended for direct full-image KSampler use, because 4K/8K latent canvases can be too large for a normal untiled sampler.
+These latent outputs are for L13 follow-up processing and debugging. They are not recommended for direct full-image KSampler use, because 2K/4K/8K latent canvases can be too large for a normal untiled sampler.
 
 `细节差异尺度` controls the lowpass kernel used to extract `细节差异潜空间`. `输出遮罩尺寸` controls whether `接缝遮罩` and `主体保护遮罩` are returned at latent resolution or final image resolution; `latent尺寸` is the default and uses less memory.
 
@@ -107,9 +107,9 @@ For automatic regional prompts, use `L13 视觉区域规划提示词` with any v
 
 `递进放大模式` creates intermediate canvases before the final size. It now only has `开启` and `关闭`. When enabled, it steps by about `2048px` on the short edge while keeping the reference aspect ratio. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
 
-`色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` now blends only low-frequency reference structure back into the sampled tile; this keeps composition anchoring without erasing newly generated texture.
+`色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` blends only low-frequency reference structure back into the sampled tile; this keeps composition anchoring without erasing newly generated texture.
 
-`L13 图像颜色匹配` remains available as a standalone utility, but the normal and advanced redraw nodes now include the same low-frequency color transfer on their `图像` output. Use the standalone node only when you want to compare or override the internal matched image.
+The redraw nodes no longer apply fixed-strength low-frequency color transfer on the final `图像` output. Final decoding now preserves the sampled latent and lightly boosts the sampled high-frequency residual when `细节扰动` is enabled, so texture is less likely to be flattened. `L13 图像颜色匹配` remains available as a standalone utility when a separate pixel-space color transfer is actually needed.
 
 ## L13 Advanced Context Redraw
 
@@ -147,7 +147,7 @@ For most人物图, the non-advanced local redraw node is still the simpler defau
 
 1. Generate a low-resolution composition latent with a normal KSampler, for example `1024x1024` or `1536x1536`.
 2. Connect that latent into `构图潜空间`.
-3. Set `目标规格` to `4K` or `8K`, or leave it as `自定义`.
+3. Set `目标规格` to `2K`, `4K`, or `8K`, or leave it as `自定义`.
 4. If using `自定义`, set `目标宽度` and `目标高度`. When both are the same, for example `8192 / 8192`, the value is treated as the long edge and the original latent aspect ratio is preserved.
 5. Set `重绘强度` around `0.55 - 0.75`.
 6. Decode the output latent with your VAE.
@@ -174,6 +174,7 @@ The dropdown values `加噪`, `保留剩余噪声`, and `融合方式` are also 
 
 ## Target Size Logic
 
+- `目标规格 = 2K`: the input latent's long edge becomes `2048`, and the short edge is calculated from the original latent ratio.
 - `目标规格 = 4K`: the input latent's long edge becomes `4096`, and the short edge is calculated from the original latent ratio.
 - `目标规格 = 8K`: the input latent's long edge becomes `8192`, and the short edge is calculated from the original latent ratio.
 - `目标规格 = 自定义`: `目标宽度` / `目标高度` are used directly, except when they are equal. If they are equal, that value is treated as the long edge and the original latent ratio is preserved.

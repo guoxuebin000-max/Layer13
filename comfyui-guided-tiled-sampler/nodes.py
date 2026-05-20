@@ -622,6 +622,39 @@ def _blend_reference_latent(samples: torch.Tensor, reference: torch.Tensor, stre
     return torch.lerp(samples, ref, strength)
 
 
+def _latent_lowpass(samples: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if samples.ndim != 4:
+        return samples
+    h, w = int(samples.shape[-2]), int(samples.shape[-1])
+    max_kernel = max(1, min(h, w))
+    kernel_size = max(1, min(int(kernel_size), max_kernel))
+    if kernel_size % 2 == 0:
+        kernel_size = max(1, kernel_size - 1)
+    if kernel_size <= 1:
+        return samples
+    pad = kernel_size // 2
+    work = samples.float()
+    padded = torch.nn.functional.pad(work, (pad, pad, pad, pad), mode="replicate")
+    low = torch.nn.functional.avg_pool2d(padded, kernel_size=kernel_size, stride=1)
+    return low.to(dtype=samples.dtype)
+
+
+def _lock_structure_latent(samples: torch.Tensor, reference: torch.Tensor, strength: float, kernel_size: int) -> torch.Tensor:
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength <= 0.0 or samples.ndim != 4 or reference.ndim != 4:
+        return samples
+    ref = reference.to(device=samples.device, dtype=samples.dtype)
+    if ref.shape[-2:] != samples.shape[-2:]:
+        ref = torch.nn.functional.interpolate(ref.float(), size=samples.shape[-2:], mode="bilinear", align_corners=False).to(dtype=samples.dtype)
+    if ref.shape[0] != samples.shape[0]:
+        ref = ref[:1].expand(samples.shape[0], -1, -1, -1) if ref.shape[0] == 1 else ref[:samples.shape[0]]
+    out_low = _latent_lowpass(samples, kernel_size)
+    ref_low = _latent_lowpass(ref, kernel_size)
+    out_high = samples - out_low
+    locked_low = torch.lerp(out_low, ref_low, strength)
+    return (out_high + locked_low).to(dtype=samples.dtype)
+
+
 class _CanvasProgress:
     def __init__(self, model, total_steps: int, preview_mode: str, vae=None):
         self.total = max(1, int(total_steps))
@@ -801,6 +834,8 @@ class L13AdvancedRedrawSettings:
                 "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "细节噪声强度。高级版建议 0-0.015 起步。"}),
                 "细节噪声模式": (cls.detail_noise_modes, {"tooltip": "细节扰动的噪声形态。高频最稳；多尺度更像材质；像素颗粒更硬，慎用。"}),
                 "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
+                "结构锁定强度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。只把低频结构往内部参考 latent 拉回，抑制多主体和重新构图；0 关闭。"}),
+                "结构锁定尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "结构锁定的低频尺度，单位为像素。数值越大越只锁大轮廓，越不影响细节。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
                 "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
@@ -827,6 +862,8 @@ class L13AdvancedRedrawSettings:
         细节扰动,
         细节噪声模式,
         细节噪声位置,
+        结构锁定强度,
+        结构锁定尺度,
         分块宽度,
         分块高度,
         重叠像素,
@@ -844,6 +881,8 @@ class L13AdvancedRedrawSettings:
             "细节扰动": 细节扰动,
             "细节噪声模式": 细节噪声模式,
             "细节噪声位置": 细节噪声位置,
+            "结构锁定强度": 结构锁定强度,
+            "结构锁定尺度": 结构锁定尺度,
             "分块宽度": 分块宽度,
             "分块高度": 分块高度,
             "重叠像素": 重叠像素,
@@ -1521,6 +1560,8 @@ class L13ContextMaskedRedraw8K:
         输入潜空间=None,
         细节噪声模式="高频",
         细节噪声位置="采样前",
+        结构锁定强度=0.0,
+        结构锁定尺度=64,
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -1533,6 +1574,8 @@ class L13ContextMaskedRedraw8K:
             细节扰动 = setting("细节扰动", 细节扰动)
             细节噪声模式 = setting("细节噪声模式", 细节噪声模式)
             细节噪声位置 = setting("细节噪声位置", 细节噪声位置)
+            结构锁定强度 = setting("结构锁定强度", 结构锁定强度)
+            结构锁定尺度 = setting("结构锁定尺度", 结构锁定尺度)
             分块宽度 = setting("分块宽度", 分块宽度)
             分块高度 = setting("分块高度", 分块高度)
             重叠像素 = setting("重叠像素", 重叠像素)
@@ -1757,6 +1800,11 @@ class L13ContextMaskedRedraw8K:
                     compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
                     reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                     out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
+                    if 高级采样器逻辑 and float(结构锁定强度) > 0:
+                        structure_kernel = max(1, int(round(float(结构锁定尺度) / float(scale))))
+                        out_tile = _lock_structure_latent(out_tile, base_tile, float(结构锁定强度), structure_kernel)
+                    if 高级采样器逻辑:
+                        out_tile = _match_latent_moments(out_tile, base_tile, 1.0)
                     if detail_noise is not None and 细节噪声位置 in ("写回前", "两者"):
                         local_detail = detail_noise[:, :, y0:y1, x0:x1].to(device=out_tile.device, dtype=out_tile.dtype)
                         detail_mask = torch.ones((out_tile.shape[0], 1, y1 - y0, x1 - x0), device=out_tile.device, dtype=out_tile.dtype)
@@ -1836,6 +1884,8 @@ class L13ContextMaskedRedraw8K:
                         compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
                         reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                         out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
+                        if 高级采样器逻辑:
+                            out_tile = _match_latent_moments(out_tile, base_tile, 1.0)
                         seam_weight = seam_mask[:, :, y0:y1, x0:x1].repeat(canvas.shape[0], 1, 1, 1)
                         weight = _tile_weight(y1 - y0, x1 - x0, height, width, y0, y1, x0, x1, overlap, blend, canvas.device, canvas.dtype)
                         weight = weight * seam_weight
@@ -2016,6 +2066,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
+        结构锁定强度=0.30,
+        结构锁定尺度=64,
     ):
         return self._run_redraw(
             模型,
@@ -2065,6 +2117,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             主体保护强度=主体保护强度,
             高级采样器逻辑=True,
             输入潜空间=输入潜空间,
+            结构锁定强度=结构锁定强度,
+            结构锁定尺度=结构锁定尺度,
         )
 
 

@@ -70,7 +70,7 @@ Recommended人物 8K defaults:
 - `主体重绘上限`: `0.12 - 0.16` with a subject mask.
 - `接缝修复`: `禁用` by default; use `启用` with `接缝修复强度 = 0.04 - 0.08` if seams remain.
 
-Preview/progress now follows the KleinTiled KSampler style. Each sampled tile creates an inner KSampler-style progress bar that shows the current tile latent preview, while a separate outer progress bar counts completed tiles. `预览频率 = 关闭` disables the tile preview path; the outer tile counter still advances.
+The progress bar advances by sampler step across all progressive stages, passes, and tiles. `预览频率 = 每个分块` shows the current tile latent preview. Switch it to `关闭` if the tile-switch preview flash is distracting.
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 

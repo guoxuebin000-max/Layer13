@@ -24,7 +24,7 @@ BLEND_CHOICES = ["余弦", "线性", "高斯"]
 TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
-PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
+PREVIEW_MODE_CHOICES = ["每个分块", "关闭"]
 TAIL_MERGE_RATIO = 0.45
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 ADVANCED_STEP_MODE_CHOICES = ["起始步递进", "随尺寸递进", "固定起止步"]
@@ -888,15 +888,16 @@ def _lock_structure_latent(samples: torch.Tensor, reference: torch.Tensor, stren
 
 
 class _CanvasProgress:
-    def __init__(self, model, total_tiles: int, preview_mode: str, vae=None):
-        self.total_tiles = max(1, int(total_tiles))
-        self.completed_tiles = 0
+    def __init__(self, model, total_steps: int, preview_mode: str, vae=None):
+        self.total = max(1, int(total_steps))
+        self.completed = 0
+        self.tile_start = 0
         self.tile_steps = 1
-        self.preview_mode = preview_mode
-        self.outer_pbar = comfy.utils.ProgressBar(self.total_tiles)
-        self.inner_pbar = None
+        self.preview_mode = preview_mode if preview_mode in PREVIEW_MODE_CHOICES else "每个分块"
+        self.pbar = comfy.utils.ProgressBar(self.total)
         self.previewer = None
-        if preview_mode != "关闭":
+        self.last_preview = None
+        if self.preview_mode != "关闭":
             try:
                 device = getattr(model, "load_device", None) or comfy.model_management.get_torch_device()
                 self.previewer = latent_preview.get_previewer(device, model.model.latent_format)
@@ -904,35 +905,45 @@ class _CanvasProgress:
                 logging.warning("L13 KSampler-style previewer could not be initialized: %s", exc)
 
     def start_tile(self, expected_steps: int):
+        self.tile_start = self.completed
         self.tile_steps = max(1, int(expected_steps))
-        self.inner_pbar = comfy.utils.ProgressBar(self.tile_steps)
 
     def tile_callback(self):
         def callback(step, x0, x, total_steps):
-            if self.preview_mode == "关闭" or self.inner_pbar is None:
-                return
-            current_step = min(int(step) + 1, self.tile_steps)
-            preview_warmup = max(1, int(math.ceil(self.tile_steps * 0.2)))
+            current = min(self.total, self.tile_start + max(1, int(step) + 1))
             preview = None
-            if current_step > preview_warmup and self.previewer is not None and x0 is not None:
+            if self.preview_mode == "每个分块" and self.previewer is not None and x0 is not None:
                 try:
-                    preview = self.previewer.decode_latent_to_preview_image("JPEG", x0[:1])
+                    preview = self.previewer.decode_latent_to_preview_image("JPEG", x0)
+                    self.last_preview = preview
                 except Exception as exc:
                     logging.warning("L13 KSampler preview failed and will be disabled: %s", exc)
                     self.previewer = None
-            self.inner_pbar.update_absolute(current_step, self.tile_steps, preview)
+                    self.last_preview = None
+            self.pbar.update_absolute(current, self.total, preview)
 
         return callback
 
     def capture_preview(self, latent: torch.Tensor):
-        return
+        if self.preview_mode == "关闭":
+            return
+        try:
+            if self.previewer is not None:
+                self.last_preview = self.previewer.decode_latent_to_preview_image("JPEG", latent)
+        except Exception as exc:
+            logging.warning("L13 latent preview failed and will be disabled: %s", exc)
+            self.previewer = None
+            self.last_preview = None
 
     def finish_tile(self, actual_steps: Optional[int] = None, force_preview: bool = False):
-        self.completed_tiles = min(self.total_tiles, self.completed_tiles + 1)
-        self.outer_pbar.update_absolute(self.completed_tiles, self.total_tiles, None)
+        steps = self.tile_steps if actual_steps is None else max(1, int(actual_steps))
+        self.completed = min(self.total, self.tile_start + steps)
+        preview = self.last_preview if force_preview and self.preview_mode != "关闭" else None
+        self.pbar.update_absolute(self.completed, self.total, preview)
 
     def force_preview(self):
-        return
+        if self.preview_mode != "关闭" and self.last_preview is not None:
+            self.pbar.update_absolute(self.completed, self.total, self.last_preview)
 
 
 class L13RedrawSettings:
@@ -961,7 +972,7 @@ class L13RedrawSettings:
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "KSampler 风格预览。开启时显示当前分块采样中的 latent preview；关闭最快。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "显示当前 tile 的 KSampler 风格 latent preview；关闭则只显示总进度条。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出。"}),
@@ -1072,7 +1083,7 @@ class L13AdvancedRedrawSettings:
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把参考图像缩放到目标尺寸时使用的算法。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "KSampler 风格预览。开启时显示当前分块采样中的 latent preview；关闭最快。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "显示当前 tile 的 KSampler 风格 latent preview；关闭则只显示总进度条。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入初始噪声。高级版建议更低，0.06-0.18。"}),
             }
@@ -2336,7 +2347,13 @@ class L13ContextMaskedRedraw8K:
             _effective_sampler_steps(总步数, stage_start, stage_end)
             for stage_start, stage_end in stage_step_windows
         ]
-        progress = _CanvasProgress(模型, total_tile_runs, 预览频率, VAE)
+        sampler_step_total = sum(
+            len(plan[-1]) * pass_count * stage_sampler_steps[stage_index]
+            for stage_index, plan in enumerate(stage_plans)
+        )
+        if seam_runs:
+            sampler_step_total += seam_runs * stage_sampler_steps[-1]
+        progress = _CanvasProgress(模型, sampler_step_total, 预览频率, VAE)
         current_pixels = reference_pixels
         canvas = None
         decay = float(递进强度衰减)

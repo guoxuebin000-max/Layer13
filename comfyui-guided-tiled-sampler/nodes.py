@@ -21,7 +21,7 @@ REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
-ADVANCED_STEP_MODE_CHOICES = ["随尺寸递进", "固定起止步"]
+ADVANCED_STEP_MODE_CHOICES = ["起始步递进", "随尺寸递进", "固定起止步"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
 COLOR_MATCH_METHOD_CHOICES = ["RGB均值方差", "YCbCr色度"]
@@ -350,9 +350,16 @@ def _stage_sampler_step_bounds(
 ) -> Tuple[int, int]:
     start, end = _sampler_step_bounds(steps, start_step, last_step)
     stage_count = max(1, int(stage_count))
-    if mode != "随尺寸递进" or stage_count <= 1:
+    if mode == "固定起止步" or stage_count <= 1:
         return start, end
     span = max(1, end - start)
+    if mode == "起始步递进":
+        s = start + int(math.ceil(span * int(stage_index) / stage_count))
+        if s >= end:
+            s = max(start, end - 1)
+        return s, end
+    if mode != "随尺寸递进":
+        return start, end
     s = start + int(math.floor(span * int(stage_index) / stage_count))
     e = start + int(math.floor(span * (int(stage_index) + 1) / stage_count))
     if e <= s:
@@ -869,7 +876,7 @@ class L13AdvancedRedrawSettings:
                 "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
                 "结构锁定强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。把低频结构和少量参考 latent 往内部参考拉回，抑制多主体和重新构图；0 关闭。"}),
                 "结构锁定尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "结构锁定的低频尺度，单位为像素。数值越大越只锁大轮廓，越不影响细节。"}),
-                "递进步数模式": (cls.advanced_step_modes, {"tooltip": "高级版递进时如何分配起止步。随尺寸递进会把 起始步->结束步 按尺寸阶段切开；固定起止步会每个尺寸阶段都跑同一段。"}),
+                "递进步数模式": (cls.advanced_step_modes, {"default": "起始步递进", "tooltip": "高级版递进时如何分配起止步。起始步递进会保持结束步不变、逐阶段推后起始步，例如 4-12 分两段为 4-12/8-12；随尺寸递进会把起止步切成连续小段；固定起止步会每段都跑同一段。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
                 "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
@@ -2135,7 +2142,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         主体保护强度=0.55,
         结构锁定强度=0.55,
         结构锁定尺度=64,
-        递进步数模式="随尺寸递进",
+        递进步数模式="起始步递进",
     ):
         return self._run_redraw(
             模型,

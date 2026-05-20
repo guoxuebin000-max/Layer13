@@ -24,7 +24,7 @@ BLEND_CHOICES = ["余弦", "线性", "高斯"]
 TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
-PREVIEW_MODE_CHOICES = ["每个分块", "关闭"]
+PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 TAIL_MERGE_RATIO = 0.45
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
 ADVANCED_STEP_MODE_CHOICES = ["起始步递进", "随尺寸递进", "固定起止步"]
@@ -893,14 +893,13 @@ class _CanvasProgress:
         self.completed = 0
         self.tile_start = 0
         self.tile_steps = 1
-        self.preview_mode = preview_mode if preview_mode in PREVIEW_MODE_CHOICES else "每个分块"
+        self.preview_mode = preview_mode
         self.pbar = comfy.utils.ProgressBar(self.total)
         self.previewer = None
         self.last_preview = None
-        if self.preview_mode != "关闭":
+        if preview_mode != "关闭":
             try:
-                device = getattr(model, "load_device", None) or comfy.model_management.get_torch_device()
-                self.previewer = latent_preview.get_previewer(device, model.model.latent_format)
+                self.previewer = latent_preview.get_previewer(model.load_device, model.model.latent_format)
             except Exception as exc:
                 logging.warning("L13 KSampler-style previewer could not be initialized: %s", exc)
 
@@ -972,7 +971,7 @@ class L13RedrawSettings:
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "显示当前 tile 的 KSampler 风格 latent preview；关闭则只显示总进度条。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每轮", "tooltip": "运行时预览更新频率。每轮比每个分块快，仍会在一轮 tile pass 完成后更新预览。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出。"}),
@@ -1083,7 +1082,7 @@ class L13AdvancedRedrawSettings:
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把参考图像缩放到目标尺寸时使用的算法。"}),
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
-                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每个分块", "tooltip": "显示当前 tile 的 KSampler 风格 latent preview；关闭则只显示总进度条。"}),
+                "预览频率": (PREVIEW_MODE_CHOICES, {"default": "每轮", "tooltip": "运行时预览更新频率。每轮比每个分块快，仍会在一轮 tile pass 完成后更新预览。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入初始噪声。高级版建议更低，0.06-0.18。"}),
             }
@@ -2189,7 +2188,7 @@ class L13ContextMaskedRedraw8K:
         接缝修复="禁用",
         接缝修复强度=0.06,
         接缝宽度=96,
-        预览频率="每个分块",
+        预览频率="每轮",
         加噪="启用",
         起始步=None,
         结束步=None,
@@ -2462,7 +2461,9 @@ class L13ContextMaskedRedraw8K:
                         force_full_denoise=force_full_denoise,
                         callback=progress.tile_callback(),
                     )
-                    progress.finish_tile(stage_steps)
+                    if 预览频率 == "每个分块":
+                        progress.capture_preview(out_context)
+                    progress.finish_tile(stage_steps, force_preview=(预览频率 == "每个分块"))
                     out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                     base_tile = base[:, :, y0:y1, x0:x1]
                     compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
@@ -2488,6 +2489,10 @@ class L13ContextMaskedRedraw8K:
                     weights[:, :, y0:y1, x0:x1] += weight
 
                 canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
+                if 预览频率 == "每轮":
+                    progress.capture_preview(canvas)
+                    progress.force_preview()
+
             if seam_enabled and stage_index == stage_count - 1 and len(tiles) > 1:
                 seam_latent = 0
                 if int(接缝宽度) > 0:
@@ -2550,7 +2555,9 @@ class L13ContextMaskedRedraw8K:
                             force_full_denoise=force_full_denoise,
                             callback=progress.tile_callback(),
                         )
-                        progress.finish_tile(seam_steps)
+                        if 预览频率 == "每个分块":
+                            progress.capture_preview(out_context)
+                        progress.finish_tile(seam_steps, force_preview=(预览频率 == "每个分块"))
                         out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                         base_tile = base[:, :, y0:y1, x0:x1]
                         compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
@@ -2573,6 +2580,10 @@ class L13ContextMaskedRedraw8K:
                     eps = torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6
                     updated = seam_accum / seam_weights.clamp_min(eps)
                     canvas = torch.where((seam_weights > eps).expand_as(canvas), updated, canvas)
+                    if 预览频率 == "每轮":
+                        progress.capture_preview(canvas)
+                        progress.force_preview()
+
             if stage_index < stage_count - 1:
                 current_pixels = _vae_decode_latent(VAE, canvas)
 
@@ -2615,7 +2626,7 @@ class L13ContextMaskedRedraw8K:
         接缝修复="禁用",
         接缝修复强度=0.06,
         接缝宽度=96,
-        预览频率="每个分块",
+        预览频率="每轮",
         高级参数=None,
         区域提示词=None,
         主体保护遮罩=None,
@@ -2743,7 +2754,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         接缝修复="禁用",
         接缝修复强度=0.06,
         接缝宽度=96,
-        预览频率="每个分块",
+        预览频率="每轮",
         高级参数=None,
         区域提示词=None,
         主体保护遮罩=None,

@@ -765,7 +765,7 @@ class L13RedrawSettings:
             "required": {
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
-                "递进强度衰减": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时降噪的乘数。"}),
+                "递进强度衰减": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时降噪的乘数。"}),
                 "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动。人物建议 0-0.01。"}),
                 "细节噪声模式": (cls.detail_noise_modes, {"tooltip": "细节扰动的噪声形态。高频最稳；多尺度更像材质；参考纹理会提取参考 latent 的高频；像素颗粒更硬，慎用。"}),
                 "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声，最自然；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
@@ -876,6 +876,7 @@ class L13AdvancedRedrawSettings:
                 "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
                 "结构锁定强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。把低频结构和少量参考 latent 往内部参考拉回，抑制多主体和重新构图；0 关闭。"}),
                 "结构锁定尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "结构锁定的低频尺度，单位为像素。数值越大越只锁大轮廓，越不影响细节。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "高级版采样后把参考 latent 混回输出的强度。用于保构图、保颜色和减少多主体；过高会保守或变糊。"}),
                 "递进步数模式": (cls.advanced_step_modes, {"default": "起始步递进", "tooltip": "高级版递进时如何分配起止步。起始步递进会保持结束步不变、逐阶段推后起始步，例如 4-12 分两段为 4-12/8-12；随尺寸递进会把起止步切成连续小段；固定起止步会每段都跑同一段。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
@@ -905,6 +906,7 @@ class L13AdvancedRedrawSettings:
         细节噪声位置,
         结构锁定强度,
         结构锁定尺度,
+        参考保留强度,
         递进步数模式,
         分块宽度,
         分块高度,
@@ -925,6 +927,7 @@ class L13AdvancedRedrawSettings:
             "细节噪声位置": 细节噪声位置,
             "结构锁定强度": 结构锁定强度,
             "结构锁定尺度": 结构锁定尺度,
+            "参考保留强度": 参考保留强度,
             "递进步数模式": 递进步数模式,
             "分块宽度": 分块宽度,
             "分块高度": 分块高度,
@@ -1427,7 +1430,7 @@ class L13ContextMaskedRedraw8K:
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"default": "ddim_uniform", "tooltip": "局部重绘使用的调度器。默认 ddim_uniform，适合低 CFG 参考图重绘。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
-                "降噪": ("FLOAT", {"default": 0.45, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "与 K采样器 denoise 同义。控制每个局部重绘 tile 的 img2img 去噪幅度；默认 0.45。"}),
+                "降噪": ("FLOAT", {"default": 0.35, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "与 K采样器 denoise 同义。控制每个局部重绘 tile 的 img2img 去噪幅度；默认 0.35。"}),
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
@@ -1860,7 +1863,7 @@ class L13ContextMaskedRedraw8K:
                     base_tile = base[:, :, y0:y1, x0:x1]
                     compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
                     if 高级采样器逻辑:
-                        reference_hold = max(0.0, min(0.35, float(结构锁定强度) * 0.35))
+                        reference_hold = max(0.0, min(0.8, float(参考保留强度)))
                     else:
                         reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                     out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
@@ -1949,7 +1952,7 @@ class L13ContextMaskedRedraw8K:
                         base_tile = base[:, :, y0:y1, x0:x1]
                         compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
                         if 高级采样器逻辑:
-                            reference_hold = max(0.0, min(0.35, float(结构锁定强度) * 0.35))
+                            reference_hold = max(0.0, min(0.8, float(参考保留强度)))
                         else:
                             reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                         out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)

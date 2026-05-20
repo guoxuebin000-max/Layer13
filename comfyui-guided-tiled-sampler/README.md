@@ -44,7 +44,7 @@ Recommended人物 8K defaults:
 
 - `目标规格`: `4K` by default; switch to `8K` after the 4K settings are stable.
 - `总步数`: `10`
-- `降噪`: `0.45` by default; lower it toward `0.12 - 0.22` when人物主体 starts drifting or duplicating.
+- `降噪`: `0.35` by default; lower it toward `0.12 - 0.22` when人物主体 starts drifting or duplicating.
 - `CFG引导`: `1.0` by default for reference-anchored redraw; raise only if the prompt is too weak.
 - `采样器` / `调度器`: `euler` / `ddim_uniform`
 - `分块宽度` / `分块高度`: `1024` by default; raise to `1280 - 1536` for stronger consistency.
@@ -57,7 +57,7 @@ Recommended人物 8K defaults:
 - `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
 - `递进放大模式`: `关闭` by default; use `快速2倍`, `平衡1024阶梯`, or `稳定1.5倍` only when progressive upscale is needed.
-- `递进强度衰减`: `0.85`
+- `递进强度衰减`: `0.5`
 - `色彩稳定强度`: `0`
 - `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.
 - `主体重绘上限`: `0.12 - 0.16` with a subject mask.
@@ -105,7 +105,7 @@ Reference input:
 
 The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 起始步递进`, every size stage keeps the same `结束步`, while later stages move `起始步` forward. For example, `起始步=4`, `结束步=12`: two size stages run `4-12`, `8-12`; three size stages run `4-12`, `7-12`, `10-12`. `随尺寸递进` keeps the old split behavior, dividing `起始步 -> 结束步` into continuous stage windows such as `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
-`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, preview frequency, max tile count, detail noise controls, and structure lock controls. It intentionally does not contain `降噪`, `重绘强度`, reference retention, adaptive subject denoise, or seam repair controls.
+`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, preview frequency, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
 
 For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
 

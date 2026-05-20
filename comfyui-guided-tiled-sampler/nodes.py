@@ -911,14 +911,16 @@ class _CanvasProgress:
         def callback(step, x0, x, total_steps):
             if self.preview_mode == "关闭" or self.inner_pbar is None:
                 return
+            current_step = min(int(step) + 1, self.tile_steps)
+            preview_warmup = max(1, int(math.ceil(self.tile_steps * 0.2)))
             preview = None
-            if self.previewer is not None and x0 is not None:
+            if current_step > preview_warmup and self.previewer is not None and x0 is not None:
                 try:
                     preview = self.previewer.decode_latent_to_preview_image("JPEG", x0[:1])
                 except Exception as exc:
                     logging.warning("L13 KSampler preview failed and will be disabled: %s", exc)
                     self.previewer = None
-            self.inner_pbar.update_absolute(min(int(step) + 1, self.tile_steps), self.tile_steps, preview)
+            self.inner_pbar.update_absolute(current_step, self.tile_steps, preview)
 
         return callback
 

@@ -71,9 +71,21 @@ Recommended人物 8K defaults:
 
 Preview is handled by ComfyUI's built-in sampler preview system. There is no node-level preview mode; use the normal ComfyUI preview/progress settings to enable or disable sampler previews.
 
-The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, seam repair settings, detail residual scale, and output mask size.
 
 The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0.
+
+The normal and advanced redraw nodes now also expose internal self-use debug outputs after the first `图像` output:
+
+- `最终潜空间`: the final high-resolution latent canvas after tiled redraw.
+- `参考潜空间`: the final-stage base latent encoded from the scaled reference image.
+- `细节差异潜空间`: a high-frequency residual layer computed from `最终潜空间` and `参考潜空间`, useful for inspecting or later controlling AI-added detail.
+- `接缝遮罩`: the final-stage tile seam mask, generated even when seam repair is disabled; it is black when there is no seam.
+- `主体保护遮罩`: the final-stage subject protection mask after scaling; it is black when no subject mask is connected.
+
+These latent outputs are for L13 follow-up processing and debugging. They are not recommended for direct full-image KSampler use, because 4K/8K latent canvases can be too large for a normal untiled sampler.
+
+`细节差异尺度` controls the lowpass kernel used to extract `细节差异潜空间`. `输出遮罩尺寸` controls whether `接缝遮罩` and `主体保护遮罩` are returned at latent resolution or final image resolution; `latent尺寸` is the default and uses less memory.
 
 `细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation. Progressive mode also applies a very light pixel-space sharpening between stages to counter VAE decode/encode low-pass loss.
 
@@ -119,7 +131,7 @@ Reference input:
 
 The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 起始步递进`, every size stage keeps the same `结束步`, while later stages move `起始步` forward. For example, `起始步=4`, `结束步=12`: two size stages run `4-12`, `8-12`; three size stages run `4-12`, `7-12`, `10-12`. `随尺寸递进` keeps the old split behavior, dividing `起始步 -> 结束步` into continuous stage windows such as `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
-`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
+`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, `参考保留强度`, detail residual scale, and output mask size. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
 
 For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
 

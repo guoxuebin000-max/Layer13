@@ -49,7 +49,7 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 Recommended人物 8K defaults:
 
 - `目标规格`: `4K` by default; switch to `8K` after the 4K settings are stable.
-- `总步数`: `10`
+- `步数`: `10`
 - `降噪`: `0.22` by default; raise toward `0.35 - 0.45` only when you need stronger redraw/detail.
 - `CFG引导`: `1.0` by default for reference-anchored redraw; raise only if the prompt is too weak.
 - `采样器` / `调度器`: `euler` / `ddim_uniform`
@@ -151,7 +151,7 @@ Smaller tiles reduce VRAM use but increase runtime and can reduce global consist
 
 All visible input names are Chinese, and every input includes a Chinese tooltip in ComfyUI:
 
-- Basic inputs: `模型`, `正向条件`, `负向条件`, `构图潜空间`, `随机种子`, `总步数`, `CFG引导`, `采样器`, `调度器`
+- Basic inputs: `模型`, `正向条件`, `负向条件`, `构图潜空间`, `随机种子`, `步数`, `CFG引导`, `采样器`, `调度器`
 - Target inputs: `目标规格`, `目标宽度`, `目标高度`, `重绘强度`
 - Tiling inputs: `分块宽度`, `分块高度`, `重叠像素`, `融合方式`, `构图缩放算法`, `最大分块数`
 - Noise inputs: `加噪`, `噪声种子`, `保留剩余噪声`
@@ -183,7 +183,7 @@ Use this when you want the first pass to run only the composition portion, then 
    - `return_with_leftover_noise`: `enable`
 2. Connect its output latent to `Guided Tiled KSampler Advanced 8K (Layer13)` `输入潜空间`.
 3. Guided tiled advanced node:
-   - `总步数`: same total steps, for example `30`
+   - `步数`: same total steps, for example `30`
    - `起始步`: `3`
    - `结束步`: `30`
    - `加噪`: `禁用`

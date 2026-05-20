@@ -21,6 +21,7 @@ REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 PREVIEW_MODE_CHOICES = ["每个分块", "每轮", "关闭"]
 PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
+ADVANCED_STEP_MODE_CHOICES = ["随尺寸递进", "固定起止步"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
 COLOR_MATCH_METHOD_CHOICES = ["RGB均值方差", "YCbCr色度"]
@@ -323,11 +324,42 @@ def _progressive_stage_pixels(
     return stages
 
 
-def _effective_sampler_steps(steps: int, start_step: Optional[int], last_step: Optional[int]) -> int:
+def _sampler_step_bounds(steps: int, start_step: Optional[int], last_step: Optional[int]) -> Tuple[int, int]:
     steps = max(1, int(steps))
     start = 0 if start_step is None else max(0, min(int(start_step), steps))
     end = steps if last_step is None else max(0, min(int(last_step), steps))
+    if end <= start:
+        end = min(steps, start + 1)
+    if end <= start:
+        start = max(0, end - 1)
+    return start, end
+
+
+def _effective_sampler_steps(steps: int, start_step: Optional[int], last_step: Optional[int]) -> int:
+    start, end = _sampler_step_bounds(steps, start_step, last_step)
     return max(1, end - start)
+
+
+def _stage_sampler_step_bounds(
+    steps: int,
+    start_step: Optional[int],
+    last_step: Optional[int],
+    stage_index: int,
+    stage_count: int,
+    mode: str,
+) -> Tuple[int, int]:
+    start, end = _sampler_step_bounds(steps, start_step, last_step)
+    stage_count = max(1, int(stage_count))
+    if mode != "随尺寸递进" or stage_count <= 1:
+        return start, end
+    span = max(1, end - start)
+    s = start + int(math.floor(span * int(stage_index) / stage_count))
+    e = start + int(math.floor(span * (int(stage_index) + 1) / stage_count))
+    if e <= s:
+        e = min(end, s + 1)
+    if e <= s:
+        s = max(start, e - 1)
+    return s, e
 
 
 def _clamp_float(value: float, low: float, high: float) -> float:
@@ -824,6 +856,7 @@ class L13AdvancedRedrawSettings:
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
     detail_noise_stages = DETAIL_NOISE_STAGE_CHOICES
+    advanced_step_modes = ADVANCED_STEP_MODE_CHOICES
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -834,8 +867,9 @@ class L13AdvancedRedrawSettings:
                 "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "细节噪声强度。高级版建议 0-0.015 起步。"}),
                 "细节噪声模式": (cls.detail_noise_modes, {"tooltip": "细节扰动的噪声形态。高频最稳；多尺度更像材质；像素颗粒更硬，慎用。"}),
                 "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
-                "结构锁定强度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。只把低频结构往内部参考 latent 拉回，抑制多主体和重新构图；0 关闭。"}),
+                "结构锁定强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。把低频结构和少量参考 latent 往内部参考拉回，抑制多主体和重新构图；0 关闭。"}),
                 "结构锁定尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "结构锁定的低频尺度，单位为像素。数值越大越只锁大轮廓，越不影响细节。"}),
+                "递进步数模式": (cls.advanced_step_modes, {"tooltip": "高级版递进时如何分配起止步。随尺寸递进会把 起始步->结束步 按尺寸阶段切开；固定起止步会每个尺寸阶段都跑同一段。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
                 "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
@@ -864,6 +898,7 @@ class L13AdvancedRedrawSettings:
         细节噪声位置,
         结构锁定强度,
         结构锁定尺度,
+        递进步数模式,
         分块宽度,
         分块高度,
         重叠像素,
@@ -883,6 +918,7 @@ class L13AdvancedRedrawSettings:
             "细节噪声位置": 细节噪声位置,
             "结构锁定强度": 结构锁定强度,
             "结构锁定尺度": 结构锁定尺度,
+            "递进步数模式": 递进步数模式,
             "分块宽度": 分块宽度,
             "分块高度": 分块高度,
             "重叠像素": 重叠像素,
@@ -1562,6 +1598,7 @@ class L13ContextMaskedRedraw8K:
         细节噪声位置="采样前",
         结构锁定强度=0.0,
         结构锁定尺度=64,
+        递进步数模式="固定起止步",
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -1576,6 +1613,7 @@ class L13ContextMaskedRedraw8K:
             细节噪声位置 = setting("细节噪声位置", 细节噪声位置)
             结构锁定强度 = setting("结构锁定强度", 结构锁定强度)
             结构锁定尺度 = setting("结构锁定尺度", 结构锁定尺度)
+            递进步数模式 = setting("递进步数模式", 递进步数模式)
             分块宽度 = setting("分块宽度", 分块宽度)
             分块高度 = setting("分块高度", 分块高度)
             重叠像素 = setting("重叠像素", 重叠像素)
@@ -1691,14 +1729,30 @@ class L13ContextMaskedRedraw8K:
         if 最大分块数 > 0 and total_tile_runs > 最大分块数:
             raise RuntimeError(f"L13 参考重绘放大预计运行 {total_tile_runs} 个 tile，超过最大分块数 {最大分块数}。请增大 tile 或提高最大分块数。")
 
-        sampler_steps = _effective_sampler_steps(总步数, 起始步, 结束步)
-        progress = _CanvasProgress(模型, total_tile_runs * sampler_steps, 预览频率, VAE)
+        stage_count = len(stage_plans)
+        step_mode = 递进步数模式 if 高级采样器逻辑 else "固定起止步"
+        stage_step_windows = [
+            _stage_sampler_step_bounds(总步数, 起始步, 结束步, stage_index, stage_count, step_mode)
+            for stage_index in range(stage_count)
+        ]
+        stage_sampler_steps = [
+            _effective_sampler_steps(总步数, stage_start, stage_end)
+            for stage_start, stage_end in stage_step_windows
+        ]
+        sampler_step_total = sum(
+            len(plan[-1]) * pass_count * stage_sampler_steps[stage_index]
+            for stage_index, plan in enumerate(stage_plans)
+        )
+        if seam_runs:
+            sampler_step_total += seam_runs * stage_sampler_steps[-1]
+        progress = _CanvasProgress(模型, sampler_step_total, 预览频率, VAE)
         current_pixels = reference_pixels
         canvas = None
-        stage_count = len(stage_plans)
         decay = float(递进强度衰减)
 
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
+            stage_start_step, stage_end_step = stage_step_windows[stage_index]
+            stage_steps = stage_sampler_steps[stage_index]
             if stage_index == 0 and input_latent_pixels is not None:
                 base = self._build_canvas_from_pixels(VAE, input_latent_pixels, stage_width, stage_height, 图像缩放算法)
             else:
@@ -1771,7 +1825,7 @@ class L13ContextMaskedRedraw8K:
                         local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
                         context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
 
-                    progress.start_tile(sampler_steps)
+                    progress.start_tile(stage_steps)
                     out_context = self._sample_tile(
                         模型,
                         正向条件,
@@ -1787,18 +1841,21 @@ class L13ContextMaskedRedraw8K:
                         sampler_denoise,
                         True,
                         disable_noise=disable_noise,
-                        start_step=起始步,
-                        last_step=结束步,
+                        start_step=stage_start_step,
+                        last_step=stage_end_step,
                         force_full_denoise=force_full_denoise,
                         callback=progress.tile_callback(),
                     )
                     if 预览频率 == "每个分块":
                         progress.capture_preview(out_context)
-                    progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每个分块"))
+                    progress.finish_tile(stage_steps, force_preview=(预览频率 == "每个分块"))
                     out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                     base_tile = base[:, :, y0:y1, x0:x1]
                     compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
-                    reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                    if 高级采样器逻辑:
+                        reference_hold = max(0.0, min(0.35, float(结构锁定强度) * 0.35))
+                    else:
+                        reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                     out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
                     if 高级采样器逻辑 and float(结构锁定强度) > 0:
                         structure_kernel = max(1, int(round(float(结构锁定尺度) / float(scale))))
@@ -1851,11 +1908,13 @@ class L13ContextMaskedRedraw8K:
                             noise_mask = noise_mask * (1.0 - local_protect * float(主体保护强度))
                         sampler_denoise = 1.0 if 高级采样器逻辑 else 接缝修复强度
                         if noise_mask.max().item() <= 0:
-                            progress.start_tile(sampler_steps)
-                            progress.finish_tile(sampler_steps)
+                            progress.start_tile(stage_sampler_steps[-1])
+                            progress.finish_tile(stage_sampler_steps[-1])
                             continue
 
-                        progress.start_tile(sampler_steps)
+                        seam_start_step, seam_end_step = stage_step_windows[-1]
+                        seam_steps = stage_sampler_steps[-1]
+                        progress.start_tile(seam_steps)
                         out_context = self._sample_tile(
                             模型,
                             正向条件,
@@ -1871,19 +1930,25 @@ class L13ContextMaskedRedraw8K:
                             sampler_denoise,
                             True,
                             disable_noise=disable_noise,
-                            start_step=起始步,
-                            last_step=结束步,
+                            start_step=seam_start_step,
+                            last_step=seam_end_step,
                             force_full_denoise=force_full_denoise,
                             callback=progress.tile_callback(),
                         )
                         if 预览频率 == "每个分块":
                             progress.capture_preview(out_context)
-                        progress.finish_tile(sampler_steps, force_preview=(预览频率 == "每个分块"))
+                        progress.finish_tile(seam_steps, force_preview=(预览频率 == "每个分块"))
                         out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
                         base_tile = base[:, :, y0:y1, x0:x1]
                         compatibility_hold = max(0.0, min(1.0, float(色彩稳定强度))) * 0.08
-                        reference_hold = 0.0 if 高级采样器逻辑 else max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
+                        if 高级采样器逻辑:
+                            reference_hold = max(0.0, min(0.35, float(结构锁定强度) * 0.35))
+                        else:
+                            reference_hold = max(0.0, min(0.8, float(参考保留强度) + compatibility_hold))
                         out_tile = _blend_reference_latent(out_tile, base_tile, reference_hold)
+                        if 高级采样器逻辑 and float(结构锁定强度) > 0:
+                            structure_kernel = max(1, int(round(float(结构锁定尺度) / float(scale))))
+                            out_tile = _lock_structure_latent(out_tile, base_tile, float(结构锁定强度), structure_kernel)
                         if 高级采样器逻辑:
                             out_tile = _match_latent_moments(out_tile, base_tile, 1.0)
                         seam_weight = seam_mask[:, :, y0:y1, x0:x1].repeat(canvas.shape[0], 1, 1, 1)
@@ -2014,6 +2079,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
+                "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "高级版递进时会先完成原尺寸参考，再按尺寸阶段逐级重绘放大。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
             },
             "optional": {
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
@@ -2040,6 +2106,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         结束步,
         保留剩余噪声,
         目标规格,
+        递进放大模式,
         目标宽度=8192,
         目标高度=8192,
         递进强度衰减=0.85,
@@ -2066,8 +2133,9 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         高级参数=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
-        结构锁定强度=0.30,
+        结构锁定强度=0.55,
         结构锁定尺度=64,
+        递进步数模式="随尺寸递进",
     ):
         return self._run_redraw(
             模型,
@@ -2085,7 +2153,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             目标规格,
             目标宽度,
             目标高度,
-            "关闭",
+            递进放大模式,
             递进强度衰减,
             1.0,
             细节扰动,
@@ -2119,6 +2187,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             输入潜空间=输入潜空间,
             结构锁定强度=结构锁定强度,
             结构锁定尺度=结构锁定尺度,
+            递进步数模式=递进步数模式,
         )
 
 

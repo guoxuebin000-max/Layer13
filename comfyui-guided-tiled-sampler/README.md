@@ -103,14 +103,14 @@ Latent input:
 - It then decodes that original-size sampled latent into the internal reference image.
 - The internal reference image is resized in pixel space and VAE-encoded into the high-resolution latent canvas.
 - The advanced redraw node no longer directly upscales latent tensors. This avoids the colored-noise artifacts caused by resizing noisy latent data.
-- During tile writeback, advanced mode applies a low-frequency `结构锁定` against that high-resolution internal reference latent. This is what keeps a full 12-step advanced redraw from reinterpreting every tile as a new subject.
+- During tile writeback, advanced mode applies `结构锁定` against that high-resolution internal reference latent. It locks low-frequency structure and now also mixes back a small amount of the reference latent based on the same strength, which helps suppress duplicated bodies when the sampler tries to reinterpret a tile.
 - Advanced mode also applies internal latent color matching at fixed strength `1.0` against the same high-resolution internal reference latent before each tile is written back. This matches the color/contrast statistics of the original-size sampled result instead of letting each tile drift.
 
-The advanced node does not expose `递进放大模式`. It runs a fixed target-size KSampler Advanced segment. Use the normal node for progressive 1.5x / 2x / 1024-step upscale.
+The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 随尺寸递进`, the node splits `起始步 -> 结束步` across progressive size stages. For example, `总步数=12`, `起始步=0`, `结束步=12`, four size stages will run approximately `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
 `L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, preview frequency, max tile count, detail noise controls, and structure lock controls. It intentionally does not contain `降噪`, `重绘强度`, reference retention, adaptive subject denoise, or seam repair controls.
 
-For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.30` toward `0.45`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
+For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
 
 For a segmented run:
 

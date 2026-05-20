@@ -58,7 +58,7 @@ Recommended人物 8K defaults:
 - `上下文像素`: `256` by default; raise to `384 - 512` if local redraw loses context.
 - `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
 - `重绘轮数`: `1`
-- `预览频率`: `每个分块`
+- `预览频率`: `每轮`
 - `细节扰动`: `0.00 - 0.015` for人物, `0.015 - 0.05` for背景/材质
 - `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
@@ -69,7 +69,7 @@ Recommended人物 8K defaults:
 - `主体重绘上限`: `0.12 - 0.16` with a subject mask.
 - `接缝修复`: `禁用` by default; use `启用` with `接缝修复强度 = 0.04 - 0.08` if seams remain.
 
-The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每个分块`, ComfyUI receives the same KSampler-style latent preview from each sampler callback step for the current context tile.
+The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每轮`, ComfyUI updates the preview after each full tile pass, which is faster than decoding a preview for every tile. Switch to `每个分块` only when debugging local tile behavior.
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 

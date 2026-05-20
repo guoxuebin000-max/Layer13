@@ -58,7 +58,6 @@ Recommended人物 8K defaults:
 - `上下文像素`: `256` by default; raise to `384 - 512` if local redraw loses context.
 - `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
 - `重绘轮数`: `1`
-- `预览频率`: `每轮`
 - `细节扰动`: `0.00 - 0.015` for人物, `0.015 - 0.05` for背景/材质
 - `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
@@ -70,9 +69,9 @@ Recommended人物 8K defaults:
 - `主体重绘上限`: `0.12 - 0.16` with a subject mask.
 - `接缝修复`: `禁用` by default; use `启用` with `接缝修复强度 = 0.04 - 0.08` if seams remain.
 
-The progress bar advances by sampler step across all progressive stages, passes, and tiles. With `预览频率 = 每轮`, ComfyUI updates the preview after each full tile pass, which is faster than decoding a preview for every tile. Switch to `每个分块` only when debugging local tile behavior.
+Preview is handled by ComfyUI's built-in sampler preview system. There is no node-level preview mode; use the normal ComfyUI preview/progress settings to enable or disable sampler previews.
 
-The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, preview frequency, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 
 If the final decoded image looks gray or desaturated, connect `L13 图像颜色匹配` after VAE Decode and before Save Image. Feed the decoded output into `图像` and the original first-pass image into `参考图像`. Start with `颜色匹配强度 = 0.25 - 0.40`. `RGB均值方差` restores global color and contrast more directly; `YCbCr色度` mostly restores chroma and changes brightness less.
 
@@ -120,7 +119,7 @@ Reference input:
 
 The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 起始步递进`, every size stage keeps the same `结束步`, while later stages move `起始步` forward. For example, `起始步=4`, `结束步=12`: two size stages run `4-12`, `8-12`; three size stages run `4-12`, `7-12`, `10-12`. `随尺寸递进` keeps the old split behavior, dividing `起始步 -> 结束步` into continuous stage windows such as `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
-`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, preview frequency, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
+`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
 
 For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
 

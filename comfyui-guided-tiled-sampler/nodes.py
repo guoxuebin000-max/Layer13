@@ -175,6 +175,25 @@ def _scale_pixels(pixels: torch.Tensor, width: int, height: int, method: str) ->
     return scaled.movedim(1, -1)
 
 
+def _sharpen_pixels(pixels: torch.Tensor, strength: float = 0.0, kernel_size: int = 3) -> torch.Tensor:
+    strength = _clamp_float(strength, 0.0, 1.0)
+    if strength <= 0.0 or pixels.ndim != 4:
+        return pixels
+    rgb = pixels[:, :, :, :3].clamp(0.0, 1.0)
+    h, w = int(rgb.shape[1]), int(rgb.shape[2])
+    if h < 3 or w < 3:
+        return pixels
+    kernel_size = max(3, int(kernel_size) | 1)
+    kernel_size = min(kernel_size, max(3, min(h, w) | 1))
+    pad = kernel_size // 2
+    work = rgb.movedim(-1, 1)
+    low = torch.nn.functional.avg_pool2d(torch.nn.functional.pad(work, (pad, pad, pad, pad), mode="replicate"), kernel_size=kernel_size, stride=1)
+    out_rgb = (work + (work - low) * strength).clamp(0.0, 1.0).movedim(1, -1)
+    if pixels.shape[-1] > 3:
+        return torch.cat((out_rgb, pixels[:, :, :, 3:]), dim=-1)
+    return out_rgb
+
+
 def _downsample_for_color_stats(pixels: torch.Tensor, max_edge: int = 512) -> torch.Tensor:
     height = max(1, int(pixels.shape[1]))
     width = max(1, int(pixels.shape[2]))
@@ -859,7 +878,14 @@ def _blend_reference_latent(samples: torch.Tensor, reference: torch.Tensor, stre
     if strength <= 0.0:
         return samples
     ref = reference.to(device=samples.device, dtype=samples.dtype)
-    return torch.lerp(samples, ref, strength)
+    if ref.shape[-2:] != samples.shape[-2:]:
+        ref = torch.nn.functional.interpolate(ref.float(), size=samples.shape[-2:], mode="bilinear", align_corners=False).to(dtype=samples.dtype)
+    if ref.shape[0] != samples.shape[0]:
+        ref = ref[:1].expand(samples.shape[0], -1, -1, -1) if ref.shape[0] == 1 else ref[:samples.shape[0]]
+    low_kernel = max(5, min(17, (min(int(samples.shape[-2]), int(samples.shape[-1])) // 32) * 2 + 1))
+    sample_low = _latent_lowpass(samples, low_kernel)
+    ref_low = _latent_lowpass(ref, low_kernel)
+    return (samples + (ref_low - sample_low) * strength).to(dtype=samples.dtype)
 
 
 def _latent_lowpass(samples: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -909,9 +935,9 @@ class L13RedrawSettings:
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持参考图比例。"}),
                 "递进强度衰减": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "递进模式下每进入下一段时降噪的乘数。默认 1.0 表示不衰减，避免后续阶段细节变弱。"}),
-                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动。人物建议 0-0.01。"}),
-                "细节噪声模式": (cls.detail_noise_modes, {"tooltip": "细节扰动的噪声形态。高频最稳；多尺度更像材质；参考纹理会提取参考 latent 的高频；像素颗粒更硬，慎用。"}),
-                "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声，最自然；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
+                "细节扰动": ("FLOAT", {"default": 0.008, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "在中心写回区域给 latent 加入极小高频扰动。默认轻微启用，用来减少放大后的塑料感。"}),
+                "细节噪声模式": (cls.detail_noise_modes, {"default": "多尺度", "tooltip": "细节扰动的噪声形态。多尺度更像材质；高频更细；参考纹理会提取参考 latent 的高频；像素颗粒更硬，慎用。"}),
+                "细节噪声位置": (cls.detail_noise_stages, {"default": "采样前", "tooltip": "采样前会让模型消化噪声，最自然；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢；人物 4K/8K 建议 1024-1536。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢；人物 4K/8K 建议 1024-1536。"}),
                 "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
@@ -923,7 +949,7 @@ class L13RedrawSettings:
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数；建议保持 0。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后把少量参考 latent 混回输出。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后只把参考 latent 的低频结构混回输出。默认较低，避免抹掉新生成纹理。"}),
                 "主体重绘上限": ("FLOAT", {"default": 0.14, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩占比较高的 tile 的 denoise 上限。"}),
                 "背景重绘倍率": ("FLOAT", {"default": 1.25, "min": 0.1, "max": 3.0, "step": 0.05, "round": 0.001, "tooltip": "主体占比较低的 tile 的降噪倍率。"}),
                 "主体判断阈值": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体遮罩平均值超过该阈值时按主体 tile 处理。"}),
@@ -1014,12 +1040,12 @@ class L13AdvancedRedrawSettings:
             "required": {
                 "目标宽度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标宽度。若宽高相等，例如 8192/8192，会把该值当成长边并保持输入比例。"}),
                 "目标高度": ("INT", {"default": 8192, "min": 64, "max": MAX_RESOLUTION, "step": 8, "tooltip": "自定义目标高度。若宽高相等，例如 8192/8192，会把该值当成长边并保持输入比例。"}),
-                "细节扰动": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "细节噪声强度。高级版建议 0-0.015 起步。"}),
-                "细节噪声模式": (cls.detail_noise_modes, {"tooltip": "细节扰动的噪声形态。高频最稳；多尺度更像材质；像素颗粒更硬，慎用。"}),
-                "细节噪声位置": (cls.detail_noise_stages, {"tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
+                "细节扰动": ("FLOAT", {"default": 0.006, "min": 0.0, "max": 0.25, "step": 0.005, "round": 0.001, "tooltip": "细节噪声强度。高级版默认轻微启用，避免分段重绘过平。"}),
+                "细节噪声模式": (cls.detail_noise_modes, {"default": "多尺度", "tooltip": "细节扰动的噪声形态。多尺度更像材质；高频更细；像素颗粒更硬，慎用。"}),
+                "细节噪声位置": (cls.detail_noise_stages, {"default": "采样前", "tooltip": "采样前会让模型消化噪声；写回前会直接增加颗粒像素，建议低强度；两者更强。"}),
                 "结构锁定强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "高级版专用。把低频结构和少量参考 latent 往内部参考拉回，抑制多主体和重新构图；0 关闭。"}),
                 "结构锁定尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "结构锁定的低频尺度，单位为像素。数值越大越只锁大轮廓，越不影响细节。"}),
-                "参考保留强度": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "高级版采样后把参考 latent 混回输出的强度。用于保构图、保颜色和减少多主体；过高会保守或变糊。"}),
+                "参考保留强度": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "高级版采样后只把参考 latent 的低频结构混回输出；过高会保守或变糊。"}),
                 "递进步数模式": (cls.advanced_step_modes, {"default": "起始步递进", "tooltip": "高级版递进时如何分配起止步。起始步递进会保持结束步不变、逐阶段推后起始步，例如 4-12 分两段为 4-12/8-12；随尺寸递进会把起止步切成连续小段；固定起止步会每段都跑同一段。"}),
                 "分块宽度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素宽度。调大一致性更好但更慢。"}),
                 "分块高度": ("INT", {"default": 1024, "min": 128, "max": MAX_RESOLUTION, "step": 8, "tooltip": "中心写回区域的像素高度。调大一致性更好但更慢。"}),
@@ -2125,7 +2151,7 @@ class L13ContextMaskedRedraw8K:
         分块顺序,
         最大分块数,
         色彩稳定强度=0.0,
-        参考保留强度=0.06,
+        参考保留强度=0.03,
         主体重绘上限=0.14,
         背景重绘倍率=1.25,
         主体判断阈值=0.18,
@@ -2141,7 +2167,7 @@ class L13ContextMaskedRedraw8K:
         高级参数=None,
         高级采样器逻辑=False,
         输入潜空间=None,
-        细节噪声模式="高频",
+        细节噪声模式="多尺度",
         细节噪声位置="采样前",
         参考噪声强度=0.0,
         结构锁定强度=0.0,
@@ -2506,7 +2532,7 @@ class L13ContextMaskedRedraw8K:
                     canvas = torch.where((seam_weights > eps).expand_as(canvas), updated, canvas)
 
             if stage_index < stage_count - 1:
-                current_pixels = _vae_decode_latent(VAE, canvas)
+                current_pixels = _sharpen_pixels(_vae_decode_latent(VAE, canvas), 0.08, 3)
 
         image = _vae_decode_latent(VAE, canvas)
         image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
@@ -2530,7 +2556,7 @@ class L13ContextMaskedRedraw8K:
         目标宽度=8192,
         目标高度=8192,
         递进强度衰减=1.0,
-        细节扰动=0.0,
+        细节扰动=0.008,
         分块宽度=1024,
         分块高度=1024,
         重叠像素=128,
@@ -2542,7 +2568,7 @@ class L13ContextMaskedRedraw8K:
         分块顺序="顺序",
         最大分块数=4096,
         色彩稳定强度=0.0,
-        参考保留强度=0.06,
+        参考保留强度=0.03,
         主体重绘上限=0.14,
         背景重绘倍率=1.25,
         主体判断阈值=0.18,
@@ -2656,7 +2682,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         目标宽度=8192,
         目标高度=8192,
         递进强度衰减=1.0,
-        细节扰动=0.0,
+        细节扰动=0.006,
         分块宽度=1024,
         分块高度=1024,
         重叠像素=128,
@@ -2668,7 +2694,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         分块顺序="顺序",
         最大分块数=4096,
         色彩稳定强度=0.0,
-        参考保留强度=0.06,
+        参考保留强度=0.03,
         主体重绘上限=0.14,
         背景重绘倍率=1.25,
         主体判断阈值=0.18,

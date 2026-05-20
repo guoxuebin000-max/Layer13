@@ -58,14 +58,14 @@ Recommended人物 8K defaults:
 - `上下文像素`: `256` by default; raise to `384 - 512` if local redraw loses context.
 - `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
 - `重绘轮数`: `1`
-- `细节扰动`: `0.00 - 0.015` for人物, `0.015 - 0.05` for背景/材质
-- `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
+- `细节扰动`: `0.008` by default for the normal node, `0.006` for the advanced node. Lower it to `0` for maximum smoothness, or raise carefully toward `0.015 - 0.03` for stronger material texture.
+- `细节噪声模式`: `多尺度` is the default because it preserves material variation better than plain high-frequency grain; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
 - `参考噪声强度`: `0.08 - 0.25` mixes the reference latent's normalized structure into the global sampler noise, similar to KleinTiled's `latent_blend` noise guidance. Use it to test stronger structure/light retention without raising denoise.
 - `递进放大模式`: `开启` by default. It advances by about `2048px` on the short edge per stage while preserving aspect ratio; set it to `关闭` to jump directly to the target size.
 - `递进强度衰减`: `1.0` by default, so progressive stages do not automatically lose denoise/detail.
 - `色彩稳定强度`: `0`
-- `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.
+- `参考保留强度`: `0.03` by default. It now only pulls low-frequency reference structure back into the sampled tile, so newly sampled high-frequency texture is not blended away.
 - `主体重绘上限`: `0.12 - 0.16` with a subject mask.
 - `接缝修复`: `禁用` by default; use `启用` with `接缝修复强度 = 0.04 - 0.08` if seams remain.
 
@@ -75,7 +75,7 @@ The normal `L13 参考重绘放大` node keeps `降噪` visible because it is th
 
 The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0.
 
-`细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation.
+`细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation. Progressive mode also applies a very light pixel-space sharpening between stages to counter VAE decode/encode low-pass loss.
 
 This is deliberately simpler than LG Noise Injection's model-level CFG feature injection. LG-style injection changes the model's CFG output over part of the sampler timeline; the L13 detail noise is local to each masked tile, easier to predict, and less likely to change the subject. For “more pixels / less plastic texture”, start with `细节扰动 = 0.008`, `细节噪声模式 = 多尺度`, `细节噪声位置 = 采样前`. If the image is still too smooth, try `写回前` at `0.004 - 0.01`.
 
@@ -93,7 +93,7 @@ For automatic regional prompts, use `L13 视觉区域规划提示词` with any v
 
 `递进放大模式` creates intermediate canvases before the final size. It now only has `开启` and `关闭`. When enabled, it steps by about `2048px` on the short edge while keeping the reference aspect ratio. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
 
-`色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` mixes a small amount of the reference latent back into the sampled tile and is the safer way to preserve pre-upscale texture.
+`色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` now blends only low-frequency reference structure back into the sampled tile; this keeps composition anchoring without erasing newly generated texture.
 
 `L13 图像颜色匹配` remains available as a standalone utility, but the normal and advanced redraw nodes now include the same low-frequency color transfer on their `图像` output. Use the standalone node only when you want to compare or override the internal matched image.
 

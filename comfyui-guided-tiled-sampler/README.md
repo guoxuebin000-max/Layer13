@@ -28,6 +28,12 @@ Then restart ComfyUI.
 
 `sampling/l13_redraw -> L13 参考重绘放大参数（高级）`
 
+`sampling/l13_redraw -> L13 区域提示词`
+
+`sampling/l13_redraw -> L13 视觉区域规划提示词`
+
+`sampling/l13_redraw -> L13 视觉区域JSON转提示词`
+
 `image/l13 -> L13 图像颜色匹配`
 
 ## L13 Reference Redraw Workflow
@@ -76,6 +82,10 @@ This is deliberately simpler than LG Noise Injection's model-level CFG feature i
 `采样缓冲像素` separates the sampled area from the written area. Each tile now samples `write core + sample halo` inside the larger context crop, but only writes the original center tile back to the full latent canvas. This reduces hard mask edges while keeping context read-only.
 
 `主体保护遮罩` now does two jobs. It still softens the noise mask inside protected areas, and it also enables adaptive tile denoise: subject-heavy tiles are capped by `主体重绘上限`, while low-subject tiles may use `背景重绘倍率` to add more background texture. `主体重绘上限` is not a second global denoise value; it only applies when a subject mask is connected and the current tile contains enough subject pixels.
+
+`L13 区域提示词` adds mask-based regional prompts without requiring the user to know tile boundaries. Connect `CLIP`, a full-image `遮罩`, and regional positive/negative text. Chain multiple region nodes through `已有区域提示词`, then connect the final `区域提示词` output to the normal or advanced redraw node. During progressive upscale, the redraw node scales each region mask to the current stage latent size and crops it to the current context tile before sampling. `遮罩羽化` is converted from pixels to latent units per stage. `区域范围 = 遮罩范围` keeps the conditioning area tight around the local mask; `整块上下文` keeps the whole context active and only uses the mask for blending strength.
+
+For automatic regional prompts, use `L13 视觉区域规划提示词` with any vision-language node that can read an image and return text. Feed its `视觉模型提示词` to the VLM prompt input and the first-pass image to the VLM image input. Connect the VLM text output to `L13 视觉区域JSON转提示词 -> 视觉模型JSON`, connect the same first-pass image to `参考图像`, then connect `区域提示词` to the redraw node. The expected VLM output is JSON with normalized `bbox` values in `x0,y0,x1,y1` order plus `positive`, `negative`, `strength`, and `feather` fields. The converter also returns a combined `区域遮罩` and `解析摘要` for checking what it found.
 
 `接缝修复` runs only on the final stage. It creates a seam mask along tile boundaries and performs one low-denoise masked redraw pass there, then writes only the seam areas back with the normal feather accumulation. Keep it off unless visible seams remain.
 

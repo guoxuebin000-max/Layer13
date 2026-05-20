@@ -1,8 +1,11 @@
 import logging
+import json
 import math
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import re
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 import comfy.sample
 import comfy.samplers
@@ -27,6 +30,9 @@ ENABLE_CHOICES = ["启用", "禁用"]
 COLOR_MATCH_METHOD_CHOICES = ["RGB均值方差", "YCbCr色度"]
 DETAIL_NOISE_MODE_CHOICES = ["高频", "细颗粒", "多尺度", "参考纹理", "像素颗粒", "关闭"]
 DETAIL_NOISE_STAGE_CHOICES = ["采样前", "写回前", "两者"]
+REGION_SCOPE_CHOICES = ["遮罩范围", "整块上下文"]
+REGION_BOX_FORMAT_CHOICES = ["自动", "x0y0x1y1", "xywh"]
+VISUAL_REGION_MODE_CHOICES = ["人物主体", "通用照片", "背景材质", "建筑空间"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "4K": 4096,
@@ -489,8 +495,91 @@ def _ordered_tiles(tiles: List[Tuple[int, int, int, int]], height: int, width: i
 def _scale_mask(mask: torch.Tensor, width: int, height: int, device, dtype) -> torch.Tensor:
     if mask.ndim == 2:
         mask = mask.unsqueeze(0)
+    elif mask.ndim == 4 and mask.shape[1] == 1:
+        mask = mask[:, 0]
     mask = mask.unsqueeze(1).to(device=device, dtype=dtype)
     return comfy.utils.common_upscale(mask, width, height, "bilinear", "disabled").clamp(0.0, 1.0)
+
+
+def _blur_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    radius = max(0, int(radius))
+    if radius <= 0:
+        return mask.clamp(0.0, 1.0)
+    kernel = radius * 2 + 1
+    out = mask
+    for _ in range(2):
+        out = F.avg_pool2d(out, kernel_size=kernel, stride=1, padding=radius)
+    return out.clamp(0.0, 1.0)
+
+
+def _conditioning_set_values(conditioning, values: Dict[str, Any]):
+    if conditioning is None:
+        return []
+    out = []
+    for entry in conditioning:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], dict):
+            copied = list(entry)
+            copied[1] = entry[1].copy()
+            copied[1].update(values)
+            out.append(copied)
+        elif isinstance(entry, dict):
+            copied = entry.copy()
+            copied.update(values)
+            out.append(copied)
+        else:
+            out.append(entry)
+    return out
+
+
+def _conditioning_has_spatial_values(conditioning) -> bool:
+    if not conditioning:
+        return False
+    for entry in conditioning:
+        meta = None
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], dict):
+            meta = entry[1]
+        elif isinstance(entry, dict):
+            meta = entry
+        if meta is not None and ("area" in meta or "mask" in meta):
+            return True
+    return False
+
+
+def _normalize_condition_mask(mask: torch.Tensor, canvas_h: int, canvas_w: int, device, dtype) -> torch.Tensor:
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    elif mask.ndim == 4 and mask.shape[1] == 1:
+        mask = mask[:, 0]
+    mask = mask.to(device=device, dtype=dtype)
+    if mask.shape[-2:] != (canvas_h, canvas_w):
+        mask = comfy.utils.common_upscale(mask.unsqueeze(1), canvas_w, canvas_h, "bilinear", "disabled").squeeze(1)
+    return mask.clamp(0.0, 1.0)
+
+
+def _clone_condition_entry(entry):
+    if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], dict):
+        copied = list(entry)
+        copied[1] = entry[1].copy()
+        return copied, copied[1]
+    if isinstance(entry, dict):
+        copied = entry.copy()
+        return copied, copied
+    return entry, None
+
+
+def _absolute_area(area: Sequence, canvas_h: Optional[int], canvas_w: Optional[int]) -> Optional[Tuple[int, int, int, int]]:
+    if len(area) < 4:
+        return None
+    if area[0] == "percentage":
+        if canvas_h is None or canvas_w is None or len(area) < 5:
+            return None
+        return (
+            max(1, int(round(float(area[1]) * canvas_h))),
+            max(1, int(round(float(area[2]) * canvas_w))),
+            int(round(float(area[3]) * canvas_h)),
+            int(round(float(area[4]) * canvas_w)),
+        )
+    return (int(area[0]), int(area[1]), int(area[2]), int(area[3]))
 
 
 def _tile_intervals(length: int, tile: int, overlap: int) -> List[Tuple[int, int]]:
@@ -966,14 +1055,314 @@ class L13ImageColorMatch:
         return (_match_image_color(图像, 参考图像, 颜色匹配强度, 匹配方式),)
 
 
+class L13RegionalPrompt:
+    scope_modes = REGION_SCOPE_CHOICES
+    enable_modes = ENABLE_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "CLIP": ("CLIP", {"tooltip": "用于在节点内编码区域提示词的 CLIP。"}),
+                "遮罩": ("MASK", {"tooltip": "区域全图遮罩。节点会在每个递进阶段自动缩放，再按 tile context 裁剪。"}),
+                "正向提示词": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True, "tooltip": "只作用在遮罩区域的正向提示词。"}),
+                "负向提示词": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True, "tooltip": "只作用在遮罩区域的负向提示词。留空则不追加区域负向。"}),
+                "区域强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "round": 0.001, "tooltip": "区域 conditioning 强度，等价于 Conditioning Set Mask 的 mask strength。"}),
+                "遮罩羽化": ("INT", {"default": 32, "min": 0, "max": 2048, "step": 8, "tooltip": "区域遮罩边缘羽化像素。递进阶段会按 VAE 压缩倍率换算到 latent。"}),
+                "区域范围": (cls.scope_modes, {"default": "遮罩范围", "tooltip": "遮罩范围会把 conditioning area 收到遮罩边界，更高效；整块上下文会在当前 tile context 内用完整 mask 混合。"}),
+                "启用": (cls.enable_modes, {"default": "启用", "tooltip": "临时禁用该区域提示词，但保留节点连接。"}),
+            },
+            "optional": {
+                "已有区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。串联多个 L13 区域提示词 节点时接这里。"}),
+            },
+        }
+
+    RETURN_TYPES = ("L13_REGION_PROMPTS",)
+    RETURN_NAMES = ("区域提示词",)
+    FUNCTION = "build"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "Builds full-image regional prompts that L13 redraw nodes scale per progressive stage and crop per tile."
+
+    def _encode(self, clip, text: str):
+        text = text or ""
+        if not text.strip():
+            return None
+        if clip is None:
+            raise RuntimeError("L13 区域提示词需要连接 CLIP 才能在节点内编码文本。")
+        tokens = clip.tokenize(text)
+        return clip.encode_from_tokens_scheduled(tokens)
+
+    def build(self, CLIP, 遮罩, 正向提示词, 负向提示词, 区域强度, 遮罩羽化, 区域范围, 启用, 已有区域提示词=None):
+        regions = list(已有区域提示词) if isinstance(已有区域提示词, list) else []
+        if not _enabled(启用):
+            return (regions,)
+        positive = self._encode(CLIP, 正向提示词)
+        negative = self._encode(CLIP, 负向提示词)
+        if positive is None and negative is None:
+            return (regions,)
+        regions.append({
+            "positive": positive,
+            "negative": negative,
+            "mask": 遮罩.clone() if isinstance(遮罩, torch.Tensor) else 遮罩,
+            "strength": float(区域强度),
+            "feather": int(遮罩羽化),
+            "set_area_to_bounds": 区域范围 == "遮罩范围",
+        })
+        return (regions,)
+
+
+def _encode_text_conditioning(clip, text: str):
+    text = text or ""
+    if not text.strip():
+        return None
+    if clip is None:
+        raise RuntimeError("L13 区域提示词需要连接 CLIP 才能在节点内编码文本。")
+    tokens = clip.tokenize(text)
+    return clip.encode_from_tokens_scheduled(tokens)
+
+
+def _extract_json_payload(text: str):
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("视觉模型 JSON 为空。")
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = min([i for i in [text.find("{"), text.find("[")] if i >= 0], default=-1)
+        end = max(text.rfind("}"), text.rfind("]"))
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def _regions_from_payload(payload) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("regions", "区域", "areas", "objects", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [r for r in value if isinstance(r, dict)]
+        return [payload]
+    return []
+
+
+def _region_bbox(region: Dict[str, Any]):
+    for key in ("bbox", "box", "bounds", "rect", "区域"):
+        value = region.get(key)
+        if isinstance(value, (list, tuple)) and len(value) >= 4:
+            return [float(value[0]), float(value[1]), float(value[2]), float(value[3])]
+    x0 = region.get("x0", region.get("left"))
+    y0 = region.get("y0", region.get("top"))
+    x1 = region.get("x1", region.get("right"))
+    y1 = region.get("y1", region.get("bottom"))
+    if all(v is not None for v in (x0, y0, x1, y1)):
+        return [float(x0), float(y0), float(x1), float(y1)]
+    x = region.get("x")
+    y = region.get("y")
+    w = region.get("w", region.get("width"))
+    h = region.get("h", region.get("height"))
+    if all(v is not None for v in (x, y, w, h)):
+        return [float(x), float(y), float(w), float(h)]
+    return None
+
+
+def _bbox_to_pixels(bbox: Sequence[float], image_w: int, image_h: int, box_format: str) -> Optional[Tuple[int, int, int, int]]:
+    if len(bbox) < 4:
+        return None
+    vals = [float(v) for v in bbox[:4]]
+    normalized = max(abs(v) for v in vals) <= 1.5
+    if normalized:
+        vals = [vals[0] * image_w, vals[1] * image_h, vals[2] * image_w, vals[3] * image_h]
+
+    x0, y0, a, b = vals
+    fmt = box_format
+    if fmt == "自动":
+        fmt = "xywh" if a <= image_w and b <= image_h and (a <= x0 or b <= y0) else "x0y0x1y1"
+    if fmt == "xywh":
+        x1 = x0 + a
+        y1 = y0 + b
+    else:
+        x1 = a
+        y1 = b
+        if x1 <= x0 or y1 <= y0:
+            x1 = x0 + a
+            y1 = y0 + b
+
+    x0 = max(0, min(image_w, int(round(x0))))
+    y0 = max(0, min(image_h, int(round(y0))))
+    x1 = max(0, min(image_w, int(round(x1))))
+    y1 = max(0, min(image_h, int(round(y1))))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _region_text(region: Dict[str, Any], keys: Sequence[str], fallback: str = "") -> str:
+    for key in keys:
+        value = region.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
+
+
+class L13VisualRegionPromptTemplate:
+    modes = VISUAL_REGION_MODE_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "分析模式": (cls.modes, {"default": "人物主体", "tooltip": "给视觉模型的区域规划目标。"}),
+                "基础提示词": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False, "tooltip": "可选。让视觉模型参考你的总提示词来规划区域描述。"}),
+                "最大区域数": ("INT", {"default": 6, "min": 1, "max": 20, "tooltip": "要求视觉模型最多输出多少个区域。"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("视觉模型提示词",)
+    FUNCTION = "build"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "Prompt template for VLM nodes to output L13 regional prompt JSON."
+
+    def build(self, 分析模式, 基础提示词, 最大区域数):
+        if 分析模式 == "人物主体":
+            focus = "main subject, face/head, hair, clothing, important props, background materials"
+            safety = "For the main subject region, include negatives such as duplicate person, extra body, extra face, extra limbs."
+        elif 分析模式 == "背景材质":
+            focus = "large background material regions such as wall, floor, sky, water, foliage, fabric, metal, wood, stone"
+            safety = "Avoid creating new people in background regions by adding person/body/face to negative when appropriate."
+        elif 分析模式 == "建筑空间":
+            focus = "architecture, wall, floor, ceiling, windows, furniture, hard edges, repeated patterns"
+            safety = "Preserve perspective and line structure; avoid warped geometry in negatives."
+        else:
+            focus = "visually important regions, main subject, foreground, background, material areas"
+            safety = "Keep descriptions local to each region."
+
+        prompt = f"""Analyze the image and output ONLY valid JSON. Do not use markdown.
+Return at most {int(最大区域数)} regions useful for high-resolution regional redraw/upscale.
+Use normalized bbox coordinates in x0,y0,x1,y1 format, values from 0 to 1.
+Focus on: {focus}.
+{safety}
+
+Schema:
+{{
+  "regions": [
+    {{
+      "name": "short region name",
+      "bbox": [0.0, 0.0, 1.0, 1.0],
+      "positive": "local prompt for this region, detail/style/texture only",
+      "negative": "local negative prompt for this region",
+      "strength": 0.8,
+      "feather": 32
+    }}
+  ]
+}}
+
+Rules:
+- Do not invent objects not visible in the image.
+- Keep bbox tight but include enough context around the region.
+- For one-person images, mark only one main_subject region and discourage duplicates in negative.
+- Use strengths between 0.4 and 1.2.
+- Use feather between 16 and 96.
+"""
+        if 基础提示词.strip():
+            prompt += f"\nGlobal prompt context:\n{基础提示词.strip()}\n"
+        return (prompt,)
+
+
+class L13VisualRegionJSONToPrompts:
+    box_formats = REGION_BOX_FORMAT_CHOICES
+    scope_modes = REGION_SCOPE_CHOICES
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "CLIP": ("CLIP", {"tooltip": "用于把视觉模型 JSON 里的区域提示词编码成 conditioning。"}),
+                "参考图像": ("IMAGE", {"tooltip": "用于确定 bbox 对应的原图尺寸，并生成全图区域遮罩。"}),
+                "视觉模型JSON": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False, "forceInput": True, "tooltip": "视觉模型输出的 JSON。支持 ```json 代码块，也支持包含 regions 列表的对象。"}),
+                "bbox格式": (cls.box_formats, {"default": "自动", "tooltip": "视觉模型 bbox 的格式。推荐输出归一化 x0,y0,x1,y1。"}),
+                "默认区域强度": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 10.0, "step": 0.01, "round": 0.001, "tooltip": "当 JSON 中没有 strength 字段时使用。"}),
+                "默认遮罩羽化": ("INT", {"default": 32, "min": 0, "max": 2048, "step": 8, "tooltip": "当 JSON 中没有 feather 字段时使用。"}),
+                "区域范围": (cls.scope_modes, {"default": "遮罩范围", "tooltip": "遮罩范围会把 conditioning area 收到 bbox/mask 边界，更高效。"}),
+                "追加人物负向": (ENABLE_CHOICES, {"default": "启用", "tooltip": "自动给 main/person/subject 区域追加 duplicate person 等负向词。"}),
+                "最大区域数": ("INT", {"default": 8, "min": 1, "max": 64, "tooltip": "最多解析多少个区域，防止视觉模型输出过多区域拖慢采样。"}),
+            },
+            "optional": {
+                "已有区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。串联已有区域提示词。"}),
+            },
+        }
+
+    RETURN_TYPES = ("L13_REGION_PROMPTS", "MASK", "STRING")
+    RETURN_NAMES = ("区域提示词", "区域遮罩", "解析摘要")
+    FUNCTION = "convert"
+    CATEGORY = "sampling/l13_redraw"
+    DESCRIPTION = "Converts VLM JSON bbox regions into L13 regional prompt masks and conditioning."
+
+    def convert(self, CLIP, 参考图像, 视觉模型JSON, bbox格式, 默认区域强度, 默认遮罩羽化, 区域范围, 追加人物负向, 最大区域数, 已有区域提示词=None):
+        image_h = max(1, int(参考图像.shape[1]))
+        image_w = max(1, int(参考图像.shape[2]))
+        batch = max(1, int(参考图像.shape[0]))
+        regions = list(已有区域提示词) if isinstance(已有区域提示词, list) else []
+        combined_mask = torch.zeros((batch, image_h, image_w), dtype=参考图像.dtype, device=参考图像.device)
+        payload = _extract_json_payload(视觉模型JSON)
+        raw_regions = _regions_from_payload(payload)
+        summary = []
+        added = 0
+        subject_negative = "duplicate person, extra person, extra body, extra face, extra limbs, cloned body, split body"
+
+        for raw in raw_regions:
+            if added >= int(最大区域数):
+                break
+            bbox = _region_bbox(raw)
+            if bbox is None:
+                continue
+            box = _bbox_to_pixels(bbox, image_w, image_h, bbox格式)
+            if box is None:
+                continue
+            x0, y0, x1, y1 = box
+            mask = torch.zeros((batch, image_h, image_w), dtype=参考图像.dtype, device=参考图像.device)
+            mask[:, y0:y1, x0:x1] = 1.0
+            combined_mask = torch.maximum(combined_mask, mask)
+
+            name = _region_text(raw, ("name", "label", "region", "类别"), fallback=f"region_{added + 1}")
+            positive_text = _region_text(raw, ("positive", "prompt", "正向", "description", "描述"), fallback=name)
+            negative_text = _region_text(raw, ("negative", "negative_prompt", "负向"), fallback="")
+            lower_name = name.lower()
+            if _enabled(追加人物负向) and any(word in lower_name for word in ("person", "subject", "human", "body", "face", "人物", "主体", "人像", "脸")):
+                negative_text = (negative_text + ", " + subject_negative).strip(", ")
+
+            positive = _encode_text_conditioning(CLIP, positive_text)
+            negative = _encode_text_conditioning(CLIP, negative_text)
+            regions.append({
+                "positive": positive,
+                "negative": negative,
+                "mask": mask,
+                "strength": float(raw.get("strength", 默认区域强度)),
+                "feather": int(raw.get("feather", 默认遮罩羽化)),
+                "set_area_to_bounds": 区域范围 == "遮罩范围",
+            })
+            summary.append(f"{name}: ({x0},{y0})-({x1},{y1})")
+            added += 1
+
+        if added == 0:
+            raise RuntimeError("没有从视觉模型 JSON 中解析到有效区域。请确认 JSON 包含 regions 列表和 bbox 字段。")
+        return (regions, combined_mask.clamp(0.0, 1.0), "\n".join(summary))
+
+
 def _crop_mask(mask: torch.Tensor, y0: int, y1: int, x0: int, x1: int) -> torch.Tensor:
     if mask.ndim < 2:
         return mask
     return mask[..., y0:y1, x0:x1]
 
 
-def _intersect_area(area: Sequence[int], y0: int, y1: int, x0: int, x1: int) -> Optional[Tuple[int, int, int, int]]:
-    if len(area) < 4:
+def _intersect_area(area: Sequence, y0: int, y1: int, x0: int, x1: int, canvas_h: Optional[int] = None, canvas_w: Optional[int] = None) -> Optional[Tuple[int, int, int, int]]:
+    area = _absolute_area(area, canvas_h, canvas_w)
+    if area is None:
         return None
     h, w, y, x = int(area[0]), int(area[1]), int(area[2]), int(area[3])
     iy0 = max(y, y0)
@@ -985,20 +1374,83 @@ def _intersect_area(area: Sequence[int], y0: int, y1: int, x0: int, x1: int) -> 
     return (iy1 - iy0, ix1 - ix0, iy0 - y0, ix0 - x0)
 
 
-def _tile_conditioning(conds: Optional[List[Dict]], y0: int, y1: int, x0: int, x1: int) -> Optional[List[Dict]]:
+def _tile_conditioning(
+    conds,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    canvas_h: Optional[int] = None,
+    canvas_w: Optional[int] = None,
+    device=None,
+    dtype=None,
+):
     if conds is None:
         return None
     out = []
     for cond in conds:
-        modified = cond.copy()
-        if "area" in modified:
-            local_area = _intersect_area(modified["area"], y0, y1, x0, x1)
+        modified, meta = _clone_condition_entry(cond)
+        if meta is None:
+            out.append(modified)
+            continue
+        if "area" in meta:
+            local_area = _intersect_area(meta["area"], y0, y1, x0, x1, canvas_h, canvas_w)
             if local_area is None:
                 continue
-            modified["area"] = local_area
-        if "mask" in modified:
-            modified["mask"] = _crop_mask(modified["mask"], y0, y1, x0, x1)
+            meta["area"] = local_area
+        if "mask" in meta:
+            mask = meta["mask"]
+            if isinstance(mask, torch.Tensor) and canvas_h is not None and canvas_w is not None:
+                mask_device = device if device is not None else mask.device
+                mask_dtype = dtype if dtype is not None else mask.dtype
+                mask = _normalize_condition_mask(mask, canvas_h, canvas_w, mask_device, mask_dtype)
+            meta["mask"] = _crop_mask(mask, y0, y1, x0, x1)
         out.append(modified)
+    return out
+
+
+def _prepare_stage_regions(regions, width: int, height: int, scale: int, device, dtype) -> List[Dict[str, Any]]:
+    if not isinstance(regions, list):
+        return []
+    prepared = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        mask = region.get("mask")
+        if not isinstance(mask, torch.Tensor):
+            continue
+        stage_mask = _scale_mask(mask, width, height, device, dtype)
+        feather = max(0, int(round(float(region.get("feather", 0)) / max(1, int(scale)))))
+        stage_mask = _blur_mask(stage_mask, feather)
+        if stage_mask.max().item() <= 0:
+            continue
+        prepared.append({
+            "positive": region.get("positive"),
+            "negative": region.get("negative"),
+            "mask": stage_mask,
+            "strength": float(region.get("strength", 1.0)),
+            "set_area_to_bounds": bool(region.get("set_area_to_bounds", True)),
+        })
+    return prepared
+
+
+def _conditioning_with_region_prompts(base_conditioning, stage_regions, kind: str, cy0: int, cy1: int, cx0: int, cx1: int):
+    out = list(base_conditioning) if base_conditioning is not None else []
+    if not stage_regions:
+        return out
+    for region in stage_regions:
+        conditioning = region.get(kind)
+        if conditioning is None:
+            continue
+        local_mask = region["mask"][:, :, cy0:cy1, cx0:cx1]
+        if local_mask.max().item() <= 0:
+            continue
+        values = {
+            "mask": local_mask[:, 0].contiguous(),
+            "mask_strength": float(region.get("strength", 1.0)),
+            "set_area_to_bounds": bool(region.get("set_area_to_bounds", True)),
+        }
+        out.extend(_conditioning_set_values(conditioning, values))
     return out
 
 
@@ -1079,7 +1531,7 @@ class TiledCondBatch:
             cx0 = max(0, x0 - context)
             cx1 = min(width, x1 + context)
             x_tile = x[:, :, cy0:cy1, cx0:cx1]
-            tile_conds = [_tile_conditioning(c, cy0, cy1, cx0, cx1) for c in conds]
+            tile_conds = [_tile_conditioning(c, cy0, cy1, cx0, cx1, height, width, x.device, x.dtype) for c in conds]
             tile_out = comfy.samplers.calc_cond_batch(model, tile_conds, x_tile, sigma, tile_options)
             oy0 = y0 - cy0
             oy1 = oy0 + (y1 - y0)
@@ -1434,6 +1886,7 @@ class L13ContextMaskedRedraw8K:
             },
             "optional": {
                 "高级参数": ("L13_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数 节点后，会覆盖本节点里折叠的高级参数。"}),
+                "区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。连接 L13 区域提示词 后，节点会在每个递进阶段缩放区域遮罩，并自动裁进每个 tile。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
             }
         }
@@ -1609,6 +2062,7 @@ class L13ContextMaskedRedraw8K:
         结构锁定强度=0.0,
         结构锁定尺度=64,
         递进步数模式="固定起止步",
+        区域提示词=None,
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -1788,6 +2242,8 @@ class L13ContextMaskedRedraw8K:
                 protect_mask = _scale_mask(主体保护遮罩, width, height, canvas.device, canvas.dtype)
                 protect_mask = protect_mask.clamp(0.0, 1.0)
 
+            stage_regions = _prepare_stage_regions(区域提示词, width, height, scale, canvas.device, canvas.dtype)
+
             for pass_index in range(pass_count):
                 accum = torch.zeros_like(canvas)
                 weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
@@ -1835,11 +2291,16 @@ class L13ContextMaskedRedraw8K:
                         local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
                         context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(细节扰动)
 
+                    tile_positive = _tile_conditioning(正向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
+                    tile_negative = _tile_conditioning(负向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
+                    tile_positive = _conditioning_with_region_prompts(tile_positive, stage_regions, "positive", cy0, cy1, cx0, cx1)
+                    tile_negative = _conditioning_with_region_prompts(tile_negative, stage_regions, "negative", cy0, cy1, cx0, cx1)
+
                     progress.start_tile(stage_steps)
                     out_context = self._sample_tile(
                         模型,
-                        正向条件,
-                        负向条件,
+                        tile_positive,
+                        tile_negative,
                         context_latent,
                         context_noise,
                         noise_mask,
@@ -1922,13 +2383,18 @@ class L13ContextMaskedRedraw8K:
                             progress.finish_tile(stage_sampler_steps[-1])
                             continue
 
+                        tile_positive = _tile_conditioning(正向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
+                        tile_negative = _tile_conditioning(负向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
+                        tile_positive = _conditioning_with_region_prompts(tile_positive, stage_regions, "positive", cy0, cy1, cx0, cx1)
+                        tile_negative = _conditioning_with_region_prompts(tile_negative, stage_regions, "negative", cy0, cy1, cx0, cx1)
+
                         seam_start_step, seam_end_step = stage_step_windows[-1]
                         seam_steps = stage_sampler_steps[-1]
                         progress.start_tile(seam_steps)
                         out_context = self._sample_tile(
                             模型,
-                            正向条件,
-                            负向条件,
+                            tile_positive,
+                            tile_negative,
                             context_latent,
                             context_noise,
                             noise_mask,
@@ -2018,6 +2484,7 @@ class L13ContextMaskedRedraw8K:
         接缝宽度=96,
         预览频率="每个分块",
         高级参数=None,
+        区域提示词=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
     ):
@@ -2061,6 +2528,7 @@ class L13ContextMaskedRedraw8K:
             接缝宽度,
             预览频率=预览频率,
             高级参数=高级参数,
+            区域提示词=区域提示词,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
         )
@@ -2093,6 +2561,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             },
             "optional": {
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
+                "区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。连接 L13 区域提示词 后，节点会在每个递进阶段缩放区域遮罩，并自动裁进每个 tile。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
             }
         }
@@ -2141,6 +2610,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         接缝宽度=96,
         预览频率="每个分块",
         高级参数=None,
+        区域提示词=None,
         主体保护遮罩=None,
         主体保护强度=0.55,
         结构锁定强度=0.55,
@@ -2191,6 +2661,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             结束步=结束步,
             保留剩余噪声=保留剩余噪声,
             高级参数=高级参数,
+            区域提示词=区域提示词,
             主体保护遮罩=主体保护遮罩,
             主体保护强度=主体保护强度,
             高级采样器逻辑=True,
@@ -2206,6 +2677,9 @@ NODE_CLASS_MAPPINGS = {
     "Layer13RedrawSettings": L13RedrawSettings,
     "Layer13AdvancedRedrawSettings": L13AdvancedRedrawSettings,
     "Layer13ImageColorMatch": L13ImageColorMatch,
+    "Layer13RegionalPrompt": L13RegionalPrompt,
+    "Layer13VisualRegionPromptTemplate": L13VisualRegionPromptTemplate,
+    "Layer13VisualRegionJSONToPrompts": L13VisualRegionJSONToPrompts,
     "Layer13ContextMaskedRedraw8K": L13ContextMaskedRedraw8K,
     "Layer13ContextMaskedRedrawAdvanced8K": L13ContextMaskedRedrawAdvanced8K,
 }
@@ -2216,6 +2690,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Layer13RedrawSettings": "L13 参考重绘放大参数",
     "Layer13AdvancedRedrawSettings": "L13 参考重绘放大参数（高级）",
     "Layer13ImageColorMatch": "L13 图像颜色匹配",
+    "Layer13RegionalPrompt": "L13 区域提示词",
+    "Layer13VisualRegionPromptTemplate": "L13 视觉区域规划提示词",
+    "Layer13VisualRegionJSONToPrompts": "L13 视觉区域JSON转提示词",
     "Layer13ContextMaskedRedraw8K": "L13 参考重绘放大",
     "Layer13ContextMaskedRedrawAdvanced8K": "L13 参考重绘放大（高级）",
 }

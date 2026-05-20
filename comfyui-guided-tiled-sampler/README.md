@@ -44,7 +44,7 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 2. Connect that image to `参考图像` and connect the matching `VAE`.
 3. Choose `目标规格 = 4K` or `8K`.
 4. The node scales the image to target size, VAE-encodes it into a high-resolution latent canvas, then redraws center tiles with context using `noise_mask`.
-5. Decode the output latent with tiled VAE decode.
+5. The node outputs both `samples` and an internally decoded `图像`. Internal VAE encode/decode uses 1024px tiles with 128px overlap.
 
 Recommended人物 8K defaults:
 
@@ -73,7 +73,7 @@ Preview is handled by ComfyUI's built-in sampler preview system. There is no nod
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 
-If the final decoded image looks gray or desaturated, connect `L13 图像颜色匹配` after VAE Decode and before Save Image. Feed the decoded output into `图像` and the original first-pass image into `参考图像`. Start with `颜色匹配强度 = 0.25 - 0.40`. `RGB均值方差` restores global color and contrast more directly; `YCbCr色度` mostly restores chroma and changes brightness less.
+The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0. Keep using `samples` if you want to do your own VAE decode or downstream latent work.
 
 `细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation.
 
@@ -95,7 +95,7 @@ For automatic regional prompts, use `L13 视觉区域规划提示词` with any v
 
 `色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` mixes a small amount of the reference latent back into the sampled tile and is the safer way to preserve pre-upscale texture.
 
-If the normal `L13 参考重绘放大` output looks gray after VAE decode, place `L13 图像颜色匹配` after `VAE解码（分块）` and before saving. Use the first-pass reference image as `参考图像`, `匹配方式 = 低频颜色迁移`, and start with `颜色匹配强度 = 0.75`. This mode is designed for nearly identical compositions: it transfers the reference image's low-frequency local color and color temperature while keeping the upscaled image's high-frequency detail. This keeps the redraw node output as latent and avoids an extra internal VAE decode/encode cycle.
+`L13 图像颜色匹配` remains available as a standalone utility, but the normal and advanced redraw nodes now include the same low-frequency color transfer on their `图像` output. Use the standalone node only when you want to compare or override the internal matched image.
 
 ## L13 Advanced Context Redraw
 

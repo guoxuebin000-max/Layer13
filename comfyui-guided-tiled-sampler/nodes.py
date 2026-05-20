@@ -15,6 +15,8 @@ import latent_preview
 
 
 MAX_RESOLUTION = 16384
+VAE_TILE_SIZE = 1024
+VAE_TILE_OVERLAP = 128
 _MISSING = object()
 _REGION_PROMPT_STORE: Dict[str, Dict[str, Any]] = {}
 
@@ -320,7 +322,7 @@ def _match_image_color(
 def _vae_encode_pixels(vae, pixels: torch.Tensor) -> torch.Tensor:
     pixels = pixels[:, :, :, :3]
     if max(int(pixels.shape[1]), int(pixels.shape[2])) >= 2048 and hasattr(vae, "encode_tiled"):
-        return vae.encode_tiled(pixels, tile_x=1024, tile_y=1024, overlap=128)
+        return vae.encode_tiled(pixels, tile_x=VAE_TILE_SIZE, tile_y=VAE_TILE_SIZE, overlap=VAE_TILE_OVERLAP)
     return vae.encode(pixels)
 
 
@@ -329,7 +331,7 @@ def _vae_decode_latent(vae, samples: torch.Tensor) -> torch.Tensor:
     pixel_w = int(samples.shape[-1]) * _vae_scale(vae)
     if max(pixel_h, pixel_w) >= 2048 and hasattr(vae, "decode_tiled"):
         try:
-            return vae.decode_tiled(samples, tile_x=1024, tile_y=1024, overlap=128)
+            return vae.decode_tiled(samples, tile_x=VAE_TILE_SIZE, tile_y=VAE_TILE_SIZE, overlap=VAE_TILE_OVERLAP)
         except TypeError:
             return vae.decode_tiled(samples)
     return vae.decode(samples)
@@ -1967,8 +1969,8 @@ class L13ContextMaskedRedraw8K:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ("LATENT", "IMAGE")
+    RETURN_NAMES = ("samples", "图像")
     FUNCTION = "sample"
     CATEGORY = "sampling/l13_redraw"
     DESCRIPTION = "Reference-anchored context-aware masked img2img redraw pass for 4K/8K latent canvases."
@@ -2499,7 +2501,9 @@ class L13ContextMaskedRedraw8K:
             if stage_index < stage_count - 1:
                 current_pixels = _vae_decode_latent(VAE, canvas)
 
-        return ({"samples": canvas},)
+        image = _vae_decode_latent(VAE, canvas)
+        image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
+        return ({"samples": canvas}, image)
 
     def sample(
         self,

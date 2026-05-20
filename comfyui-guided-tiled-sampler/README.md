@@ -44,7 +44,7 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 2. Connect that image to `参考图像` and connect the matching `VAE`.
 3. Choose `目标规格 = 4K` or `8K`.
 4. The node scales the image to target size, VAE-encodes it into a high-resolution latent canvas, then redraws center tiles with context using `noise_mask`.
-5. The node outputs both `samples` and an internally decoded `图像`. Internal VAE encode/decode uses 1024px tiles with 128px overlap.
+5. The node outputs an internally decoded `图像`. Internal VAE encode/decode uses 1024px tiles with 128px overlap.
 
 Recommended人物 8K defaults:
 
@@ -73,7 +73,7 @@ Preview is handled by ComfyUI's built-in sampler preview system. There is no nod
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 
-The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0. Keep using `samples` if you want to do your own VAE decode or downstream latent work.
+The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0.
 
 `细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation.
 

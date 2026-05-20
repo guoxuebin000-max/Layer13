@@ -27,7 +27,8 @@ TARGET_SIZE_CHOICES = ["自定义", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
 TAIL_MERGE_RATIO = 0.45
-PROGRESSIVE_MODE_CHOICES = ["关闭", "平衡1024阶梯", "稳定1.5倍", "快速2倍"]
+PROGRESSIVE_MODE_CHOICES = ["开启", "关闭"]
+PROGRESSIVE_STEP_PIXELS = 2048
 ADVANCED_STEP_MODE_CHOICES = ["起始步递进", "随尺寸递进", "固定起止步"]
 REDRAW_PRESET_CHOICES = ["自定义", "人物稳定", "人物细节", "背景增强", "建筑线条", "极限8K保守"]
 ENABLE_CHOICES = ["启用", "禁用"]
@@ -350,6 +351,19 @@ def _pixels_from_long_edge(width: int, height: int, long_edge: int, scale: int) 
     return min(out_w, MAX_RESOLUTION), min(out_h, MAX_RESOLUTION)
 
 
+def _pixels_from_short_edge(width: int, height: int, short_edge: int, scale: int) -> Tuple[int, int]:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    short_edge = min(MAX_RESOLUTION, max(scale, int(short_edge)))
+    if width <= height:
+        out_w = _round_to_multiple_nearest(short_edge, scale)
+        out_h = _round_to_multiple_nearest(short_edge * height / width, scale)
+    else:
+        out_w = _round_to_multiple_nearest(short_edge * width / height, scale)
+        out_h = _round_to_multiple_nearest(short_edge, scale)
+    return min(out_w, MAX_RESOLUTION), min(out_h, MAX_RESOLUTION)
+
+
 def _progressive_stage_pixels(
     reference_image: torch.Tensor,
     target_size: str,
@@ -364,27 +378,20 @@ def _progressive_stage_pixels(
 
     src_h = max(1, int(reference_image.shape[1]))
     src_w = max(1, int(reference_image.shape[2]))
-    src_long = max(src_w, src_h)
-    final_long = max(final_w, final_h)
-    if final_long <= src_long:
+    src_short = min(src_w, src_h)
+    final_short = min(final_w, final_h)
+    if final_short <= src_short:
         return [(final_w, final_h)]
 
     stages: List[Tuple[int, int]] = []
-    current = float(src_long)
-    while current < final_long:
-        if mode == "快速2倍":
-            next_long = current * 2.0
-        elif mode == "稳定1.5倍":
-            next_long = current * 1.5
-        else:
-            next_long = current + 1024.0
-
-        next_long = min(float(final_long), max(next_long, current + scale))
-        stage_w, stage_h = _pixels_from_long_edge(final_w, final_h, int(round(next_long)), scale)
+    current = float(src_short)
+    while current < final_short:
+        next_short = min(float(final_short), max(current + PROGRESSIVE_STEP_PIXELS, current + scale))
+        stage_w, stage_h = _pixels_from_short_edge(final_w, final_h, int(round(next_short)), scale)
         if stages and stages[-1] == (stage_w, stage_h):
             break
         stages.append((stage_w, stage_h))
-        current = max(float(stage_w), float(stage_h))
+        current = min(float(stage_w), float(stage_h))
 
     if not stages or stages[-1] != (final_w, final_h):
         stages.append((final_w, final_h))
@@ -1959,7 +1966,7 @@ class L13ContextMaskedRedraw8K:
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "局部重绘使用的采样器。默认 euler，稳定且预览直观。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"default": "ddim_uniform", "tooltip": "局部重绘使用的调度器。默认 ddim_uniform，适合低 CFG 参考图重绘。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
-                "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "关闭会直接生成目标尺寸。平衡1024阶梯会按长边每次增加约 1024 像素；稳定1.5倍更稳更慢；快速2倍更快但人物一致性风险更高。"}),
+                "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例；关闭则直接生成目标尺寸。"}),
                 "降噪": ("FLOAT", {"default": 0.22, "min": 0.01, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "与 K采样器 denoise 同义。控制每个局部重绘 tile 的 img2img 去噪幅度；默认 0.22。"}),
             },
             "optional": {
@@ -2617,7 +2624,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填总步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "4K/8K 会保持参考图原比例，把长边设为 4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
-                "递进放大模式": (cls.progressive_modes, {"default": "关闭", "tooltip": "高级版递进时会先完成原尺寸参考，再按尺寸阶段逐级重绘放大。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
+                "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
             },
             "optional": {
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),

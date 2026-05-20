@@ -62,7 +62,7 @@ Recommended人物 8K defaults:
 - `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
 - `参考噪声强度`: `0.08 - 0.25` mixes the reference latent's normalized structure into the global sampler noise, similar to KleinTiled's `latent_blend` noise guidance. Use it to test stronger structure/light retention without raising denoise.
-- `递进放大模式`: `关闭` by default; use `快速2倍`, `平衡1024阶梯`, or `稳定1.5倍` only when progressive upscale is needed.
+- `递进放大模式`: `开启` by default. It advances by about `2048px` on the short edge per stage while preserving aspect ratio; set it to `关闭` to jump directly to the target size.
 - `递进强度衰减`: `1.0` by default, so progressive stages do not automatically lose denoise/detail.
 - `色彩稳定强度`: `0`
 - `参考保留强度`: `0.04 - 0.12` for人物, lower it if the redraw becomes too conservative.
@@ -91,7 +91,7 @@ For automatic regional prompts, use `L13 视觉区域规划提示词` with any v
 
 `接缝修复` runs only on the final stage. It creates a seam mask along tile boundaries and performs one low-denoise masked redraw pass there, then writes only the seam areas back with the normal feather accumulation. Keep it off unless visible seams remain.
 
-`递进放大模式` creates intermediate canvases before the final size. For example, a 1024px source targeting 4K with `平衡1024阶梯` runs approximately `2048 -> 3072 -> 4096`. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
+`递进放大模式` creates intermediate canvases before the final size. It now only has `开启` and `关闭`. When enabled, it steps by about `2048px` on the short edge while keeping the reference aspect ratio. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.
 
 `色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` mixes a small amount of the reference latent back into the sampled tile and is the safer way to preserve pre-upscale texture.
 

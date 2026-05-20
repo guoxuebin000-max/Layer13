@@ -53,7 +53,9 @@ Recommended人物 8K defaults:
 - `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
 - `重绘轮数`: `1`
 - `预览频率`: `每个分块`
-- `细节扰动`: `0.00 - 0.04` for人物, `0.03 - 0.08` for背景/材质
+- `细节扰动`: `0.00 - 0.015` for人物, `0.015 - 0.05` for背景/材质
+- `细节噪声模式`: `高频` is the safest default; `多尺度` is better for material texture; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
+- `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
 - `递进放大模式`: `关闭` by default; use `快速2倍`, `平衡1024阶梯`, or `稳定1.5倍` only when progressive upscale is needed.
 - `递进强度衰减`: `0.85`
 - `色彩稳定强度`: `0`
@@ -67,7 +69,9 @@ The normal `L13 参考重绘放大` node keeps `降噪` visible because it is th
 
 If the final decoded image looks gray or desaturated, connect `L13 图像颜色匹配` after VAE Decode and before Save Image. Feed the decoded output into `图像` and the original first-pass image into `参考图像`. Start with `颜色匹配强度 = 0.25 - 0.40`. `RGB均值方差` restores global color and contrast more directly; `YCbCr色度` mostly restores chroma and changes brightness less.
 
-`细节扰动` adds a tiny high-frequency latent perturbation only inside the center write mask. It uses one global noise field cropped per tile, and subject protection masks also reduce this perturbation.
+`细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation.
+
+This is deliberately simpler than LG Noise Injection's model-level CFG feature injection. LG-style injection changes the model's CFG output over part of the sampler timeline; the L13 detail noise is local to each masked tile, easier to predict, and less likely to change the subject. For “more pixels / less plastic texture”, start with `细节扰动 = 0.008`, `细节噪声模式 = 多尺度`, `细节噪声位置 = 采样前`. If the image is still too smooth, try `写回前` at `0.004 - 0.01`.
 
 `采样缓冲像素` separates the sampled area from the written area. Each tile now samples `write core + sample halo` inside the larger context crop, but only writes the original center tile back to the full latent canvas. This reduces hard mask edges while keeping context read-only.
 

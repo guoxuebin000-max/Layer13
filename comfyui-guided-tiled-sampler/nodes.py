@@ -2,6 +2,7 @@ import logging
 import json
 import math
 import re
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -15,6 +16,7 @@ import latent_preview
 
 MAX_RESOLUTION = 16384
 _MISSING = object()
+_REGION_PROMPT_STORE: Dict[str, Dict[str, Any]] = {}
 
 ADD_NOISE_CHOICES = ["启用", "禁用"]
 LEFTOVER_NOISE_CHOICES = ["禁用", "启用"]
@@ -1100,14 +1102,16 @@ class L13RegionalPrompt:
         negative = self._encode(CLIP, 负向提示词)
         if positive is None and negative is None:
             return (regions,)
-        regions.append({
+        payload = {
+            "name": "manual_region",
             "positive": positive,
             "negative": negative,
             "mask": 遮罩.clone() if isinstance(遮罩, torch.Tensor) else 遮罩,
             "strength": float(区域强度),
             "feather": int(遮罩羽化),
             "set_area_to_bounds": 区域范围 == "遮罩范围",
-        })
+        }
+        regions.append(_store_region_prompt(payload, "manual_region"))
         return (regions,)
 
 
@@ -1119,6 +1123,32 @@ def _encode_text_conditioning(clip, text: str):
         raise RuntimeError("L13 区域提示词需要连接 CLIP 才能在节点内编码文本。")
     tokens = clip.tokenize(text)
     return clip.encode_from_tokens_scheduled(tokens)
+
+
+def _store_region_prompt(payload: Dict[str, Any], name: str = "") -> Dict[str, Any]:
+    token = uuid.uuid4().hex
+    _REGION_PROMPT_STORE[token] = payload
+    return {
+        "__l13_region_ref__": token,
+        "name": name or payload.get("name", "region"),
+        "strength": float(payload.get("strength", 1.0)),
+        "feather": int(payload.get("feather", 0)),
+        "set_area_to_bounds": bool(payload.get("set_area_to_bounds", True)),
+    }
+
+
+def _resolve_region_prompt(region: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ref = region.get("__l13_region_ref__") if isinstance(region, dict) else None
+    if ref is not None:
+        stored = _REGION_PROMPT_STORE.get(ref)
+        if stored is None:
+            return None
+        merged = stored.copy()
+        for key in ("strength", "feather", "set_area_to_bounds", "name"):
+            if key in region:
+                merged[key] = region[key]
+        return merged
+    return region if isinstance(region, dict) else None
 
 
 def _extract_json_payload(text: str):
@@ -1338,14 +1368,16 @@ class L13VisualRegionJSONToPrompts:
 
             positive = _encode_text_conditioning(CLIP, positive_text)
             negative = _encode_text_conditioning(CLIP, negative_text)
-            regions.append({
+            payload = {
+                "name": name,
                 "positive": positive,
                 "negative": negative,
                 "mask": mask,
                 "strength": float(raw.get("strength", 默认区域强度)),
                 "feather": int(raw.get("feather", 默认遮罩羽化)),
                 "set_area_to_bounds": 区域范围 == "遮罩范围",
-            })
+            }
+            regions.append(_store_region_prompt(payload, name))
             summary.append(f"{name}: ({x0},{y0})-({x1},{y1})")
             added += 1
 
@@ -1414,6 +1446,7 @@ def _prepare_stage_regions(regions, width: int, height: int, scale: int, device,
         return []
     prepared = []
     for region in regions:
+        region = _resolve_region_prompt(region)
         if not isinstance(region, dict):
             continue
         mask = region.get("mask")

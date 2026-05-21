@@ -1038,7 +1038,6 @@ class L13RedrawSettings:
                 "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。"}),
                 "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入 KSampler 初始噪声，类似 KleinTiled 的 latent_blend 噪声引导。0 关闭；建议 0.08-0.25。"}),
-                "并行分块数": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": "把多个同尺寸 tile 合成一个 batch 采样。1 为关闭；2-4 可尝试提速，但显存占用会增加。区域提示词/ControlNet 等空间条件会自动退回单块。"}),
                 "细节差异尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "计算 细节差异潜空间 时的 lowpass kernel 尺寸。越大越偏向保留中高频差异。"}),
                 "输出遮罩尺寸": (cls.output_mask_sizes, {"default": "latent尺寸", "tooltip": "接缝遮罩和主体保护遮罩输出 latent 尺寸或最终图像尺寸。latent尺寸更省内存。"}),
             }
@@ -1078,7 +1077,6 @@ class L13RedrawSettings:
         接缝宽度,
         主体保护强度,
         参考噪声强度,
-        并行分块数=1,
         细节差异尺度=64,
         输出遮罩尺寸="latent尺寸",
     ):
@@ -1109,7 +1107,6 @@ class L13RedrawSettings:
             "接缝修复强度": 接缝修复强度,
             "接缝宽度": 接缝宽度,
             "主体保护强度": 主体保护强度,
-            "并行分块数": 并行分块数,
             "细节差异尺度": 细节差异尺度,
             "输出遮罩尺寸": 输出遮罩尺寸,
         },)
@@ -1147,7 +1144,6 @@ class L13AdvancedRedrawSettings:
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入初始噪声。高级版建议更低，0.06-0.18。"}),
-                "并行分块数": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": "把多个同尺寸 tile 合成一个 batch 采样。1 为关闭；2-4 可尝试提速，但显存占用会增加。区域提示词/ControlNet 等空间条件会自动退回单块。"}),
                 "细节差异尺度": ("INT", {"default": 64, "min": 8, "max": 512, "step": 8, "tooltip": "计算 细节差异潜空间 时的 lowpass kernel 尺寸。越大越偏向保留中高频差异。"}),
                 "输出遮罩尺寸": (cls.output_mask_sizes, {"default": "latent尺寸", "tooltip": "接缝遮罩和主体保护遮罩输出 latent 尺寸或最终图像尺寸。latent尺寸更省内存。"}),
             }
@@ -1180,7 +1176,6 @@ class L13AdvancedRedrawSettings:
         分块顺序,
         最大分块数,
         参考噪声强度,
-        并行分块数=1,
         细节差异尺度=64,
         输出遮罩尺寸="latent尺寸",
     ):
@@ -1204,7 +1199,6 @@ class L13AdvancedRedrawSettings:
             "图像缩放算法": 图像缩放算法,
             "分块顺序": 分块顺序,
             "最大分块数": 最大分块数,
-            "并行分块数": 并行分块数,
             "细节差异尺度": 细节差异尺度,
             "输出遮罩尺寸": 输出遮罩尺寸,
         },)
@@ -2281,7 +2275,6 @@ class L13ContextMaskedRedraw8K:
         结构锁定尺度=64,
         递进步数模式="固定起止步",
         区域提示词=None,
-        并行分块数=1,
         细节差异尺度=64,
         输出遮罩尺寸="latent尺寸",
     ):
@@ -2319,7 +2312,6 @@ class L13ContextMaskedRedraw8K:
             接缝修复强度 = setting("接缝修复强度", 接缝修复强度)
             接缝宽度 = setting("接缝宽度", 接缝宽度)
             主体保护强度 = setting("主体保护强度", 主体保护强度)
-            并行分块数 = setting("并行分块数", 并行分块数)
             细节差异尺度 = setting("细节差异尺度", 细节差异尺度)
             输出遮罩尺寸 = setting("输出遮罩尺寸", 输出遮罩尺寸)
 
@@ -2427,11 +2419,6 @@ class L13ContextMaskedRedraw8K:
             _effective_sampler_steps(总步数, stage_start, stage_end)
             for stage_start, stage_end in stage_step_windows
         ]
-        parallel_tiles = max(1, min(16, int(并行分块数)))
-        has_spatial_conditioning = (
-            _conditioning_has_meta_keys(正向条件, "area", "mask", "control")
-            or _conditioning_has_meta_keys(负向条件, "area", "mask", "control")
-        )
         current_pixels = reference_pixels
         canvas = None
         base = None
@@ -2468,12 +2455,6 @@ class L13ContextMaskedRedraw8K:
                 protect_mask = protect_mask.clamp(0.0, 1.0)
 
             stage_regions = _prepare_stage_regions(区域提示词, width, height, scale, canvas.device, canvas.dtype)
-            can_batch_tiles = (
-                parallel_tiles > 1
-                and int(canvas.shape[0]) == 1
-                and not stage_regions
-                and not has_spatial_conditioning
-            )
 
             for pass_index in range(pass_count):
                 accum = torch.zeros_like(canvas)
@@ -2566,61 +2547,22 @@ class L13ContextMaskedRedraw8K:
                     accum[:, :, y0:y1, x0:x1] += out_tile * weight
                     weights[:, :, y0:y1, x0:x1] += weight
 
-                tile_index = 0
-                while tile_index < len(tiles):
-                    first_state = build_tile_state(tiles[tile_index])
-                    tile_index += 1
-                    group = [first_state]
-                    if can_batch_tiles:
-                        while tile_index < len(tiles) and len(group) < parallel_tiles:
-                            next_state = build_tile_state(tiles[tile_index])
-                            if (
-                                next_state["context_latent"].shape != first_state["context_latent"].shape
-                                or abs(float(next_state["sampler_denoise"]) - float(first_state["sampler_denoise"])) > 1e-6
-                            ):
-                                break
-                            group.append(next_state)
-                            tile_index += 1
-
+                for tile in tiles:
+                    sample_state = build_tile_state(tile)
                     callback = latent_preview.prepare_callback(模型, stage_steps)
-                    if len(group) == 1:
-                        sample_state = group[0]
-                        out_context = self._sample_tile(
-                            模型,
-                            sample_state["tile_positive"],
-                            sample_state["tile_negative"],
-                            sample_state["context_latent"],
-                            sample_state["context_noise"],
-                            sample_state["noise_mask"],
-                            int(噪声种子),
-                            总步数,
-                            CFG引导,
-                            采样器,
-                            调度器,
-                            sample_state["sampler_denoise"],
-                            not comfy.utils.PROGRESS_BAR_ENABLED,
-                            disable_noise=disable_noise,
-                            start_step=stage_start_step,
-                            last_step=stage_end_step,
-                            force_full_denoise=force_full_denoise,
-                            callback=callback,
-                        )
-                        write_tile_result(sample_state, out_context)
-                        continue
-
                     out_context = self._sample_tile(
                         模型,
-                        正向条件,
-                        负向条件,
-                        torch.cat([state["context_latent"] for state in group], dim=0),
-                        torch.cat([state["context_noise"] for state in group], dim=0),
-                        torch.cat([state["noise_mask"] for state in group], dim=0),
+                        sample_state["tile_positive"],
+                        sample_state["tile_negative"],
+                        sample_state["context_latent"],
+                        sample_state["context_noise"],
+                        sample_state["noise_mask"],
                         int(噪声种子),
                         总步数,
                         CFG引导,
                         采样器,
                         调度器,
-                        first_state["sampler_denoise"],
+                        sample_state["sampler_denoise"],
                         not comfy.utils.PROGRESS_BAR_ENABLED,
                         disable_noise=disable_noise,
                         start_step=stage_start_step,
@@ -2628,8 +2570,7 @@ class L13ContextMaskedRedraw8K:
                         force_full_denoise=force_full_denoise,
                         callback=callback,
                     )
-                    for state, out_chunk in zip(group, out_context.split(int(canvas.shape[0]), dim=0)):
-                        write_tile_result(state, out_chunk)
+                    write_tile_result(sample_state, out_context)
 
                 canvas = accum / weights.clamp_min(torch.finfo(canvas.dtype).eps if canvas.dtype.is_floating_point else 1e-6)
 
@@ -2812,7 +2753,6 @@ class L13ContextMaskedRedraw8K:
             主体保护遮罩=_param(kwargs, "主体保护遮罩", default=None),
             主体保护强度=_param(kwargs, "主体保护强度", default=0.55),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
-            并行分块数=_param(kwargs, "并行分块数", default=1),
             细节差异尺度=_param(kwargs, "细节差异尺度", default=64),
             输出遮罩尺寸=_param(kwargs, "输出遮罩尺寸", default="latent尺寸"),
         )
@@ -2904,7 +2844,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             结构锁定尺度=_param(kwargs, "结构锁定尺度", default=64),
             递进步数模式=_param(kwargs, "递进步数模式", default="起始步递进"),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
-            并行分块数=_param(kwargs, "并行分块数", default=1),
             细节差异尺度=_param(kwargs, "细节差异尺度", default=64),
             输出遮罩尺寸=_param(kwargs, "输出遮罩尺寸", default="latent尺寸"),
         )

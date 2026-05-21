@@ -87,8 +87,6 @@ These latent outputs are for L13 follow-up processing and debugging. They are no
 
 `细节差异尺度` controls the lowpass kernel used to extract `细节差异潜空间`. `输出遮罩尺寸` controls whether `接缝遮罩` and `主体保护遮罩` are returned at latent resolution or final image resolution; `latent尺寸` is the default and uses less memory.
 
-`并行分块数` batches multiple same-size tiles into one sampler call so the GPU can be used more fully. Keep it at `1` for the safest behavior. Try `2` or `4` when VRAM is underused. It increases VRAM usage, and the node automatically falls back to single-tile sampling when regional prompts, spatial masks/areas, or ControlNet-style conditioning are present.
-
 `细节扰动` adds controlled latent texture only inside the center write mask. It uses one global noise field cropped per tile, so adjacent tiles share the same noise distribution. `细节噪声模式` controls the texture shape, and `细节噪声位置` controls whether the noise is added before sampling, directly before writeback, or both. Subject protection masks also reduce this perturbation. Progressive mode also applies a very light pixel-space sharpening between stages to counter VAE decode/encode low-pass loss.
 
 This is deliberately simpler than LG Noise Injection's model-level CFG feature injection. LG-style injection changes the model's CFG output over part of the sampler timeline; the L13 detail noise is local to each masked tile, easier to predict, and less likely to change the subject. For “more pixels / less plastic texture”, start with `细节扰动 = 0.008`, `细节噪声模式 = 多尺度`, `细节噪声位置 = 采样前`. If the image is still too smooth, try `写回前` at `0.004 - 0.01`.

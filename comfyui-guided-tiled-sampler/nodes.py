@@ -23,7 +23,6 @@ _REGION_PROMPT_STORE: Dict[str, Dict[str, Any]] = {}
 ADD_NOISE_CHOICES = ["启用", "禁用"]
 LEFTOVER_NOISE_CHOICES = ["禁用", "启用"]
 BLEND_CHOICES = ["余弦", "线性", "高斯"]
-SAMPLING_STYLE_CHOICES = ["latent分块", "细化器式分块"]
 TARGET_SIZE_CHOICES = ["自定义", "2K", "4K", "8K"]
 REFERENCE_MODE_CHOICES = ["潜空间缩放", "图像重编码"]
 TILE_ORDER_CHOICES = ["顺序", "蛇形", "中心向外"]
@@ -836,60 +835,6 @@ def _tile_weight(
     return (wy[:, None] * wx[None, :]).unsqueeze(0).unsqueeze(0)
 
 
-def _soft_sample_mask_from_rects(
-    batch: int,
-    height: int,
-    width: int,
-    write_rect: Tuple[int, int, int, int],
-    sample_rect: Tuple[int, int, int, int],
-    feather: int,
-    device,
-    dtype,
-) -> torch.Tensor:
-    mask = torch.zeros((batch, 1, height, width), device=device, dtype=dtype)
-    wy0, wy1, wx0, wx1 = write_rect
-    sy0, sy1, sx0, sx1 = sample_rect
-    wy0, wy1 = max(0, wy0), min(height, wy1)
-    wx0, wx1 = max(0, wx0), min(width, wx1)
-    sy0, sy1 = max(0, sy0), min(height, sy1)
-    sx0, sx1 = max(0, sx0), min(width, sx1)
-    if wy1 <= wy0 or wx1 <= wx0:
-        return mask
-    core = torch.zeros_like(mask)
-    core[:, :, wy0:wy1, wx0:wx1] = 1.0
-    if sy1 <= sy0 or sx1 <= sx0 or feather <= 0:
-        return core
-    sample_area = torch.zeros_like(mask)
-    sample_area[:, :, sy0:sy1, sx0:sx1] = 1.0
-    softened = _blur_mask(core, int(feather)) * sample_area
-    return torch.maximum(core, softened).clamp(0.0, 1.0)
-
-
-def _paste_pixels_with_mask(
-    canvas: torch.Tensor,
-    patch: torch.Tensor,
-    mask_nchw: torch.Tensor,
-    y0: int,
-    x0: int,
-) -> torch.Tensor:
-    h = int(patch.shape[1])
-    w = int(patch.shape[2])
-    if h <= 0 or w <= 0:
-        return canvas
-    y1 = min(int(canvas.shape[1]), y0 + h)
-    x1 = min(int(canvas.shape[2]), x0 + w)
-    if y1 <= y0 or x1 <= x0:
-        return canvas
-    patch = patch[:, : y1 - y0, : x1 - x0, :3].to(device=canvas.device, dtype=canvas.dtype)
-    mask = mask_nchw[:, :, : y1 - y0, : x1 - x0].to(device=canvas.device, dtype=canvas.dtype)
-    if mask.shape[0] != canvas.shape[0]:
-        mask = mask[:1].expand(canvas.shape[0], -1, -1, -1) if mask.shape[0] == 1 else mask[: canvas.shape[0]]
-    mask = mask.movedim(1, -1).clamp(0.0, 1.0)
-    base = canvas[:, y0:y1, x0:x1, :3]
-    canvas[:, y0:y1, x0:x1, :3] = torch.lerp(base, patch, mask).clamp(0.0, 1.0)
-    return canvas
-
-
 def _normalize_detail_noise(noise: torch.Tensor) -> torch.Tensor:
     if noise.ndim != 4:
         return noise
@@ -1047,7 +992,6 @@ def _lock_structure_latent(samples: torch.Tensor, reference: torch.Tensor, stren
 
 class L13RedrawSettings:
     blend_modes = BLEND_CHOICES
-    sampling_styles = SAMPLING_STYLE_CHOICES
     tile_orders = TILE_ORDER_CHOICES
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
@@ -1068,7 +1012,6 @@ class L13RedrawSettings:
                 "重叠像素": ("INT", {"default": 128, "min": 0, "max": 4096, "step": 8, "tooltip": "中心 tile 之间的重叠像素。128 更快，192-256 接缝更稳。"}),
                 "上下文像素": ("INT", {"default": 256, "min": 0, "max": 4096, "step": 8, "tooltip": "每个 tile 向外额外读取的上下文区域。context 只参与推理，不写回全图；256 更快，384-512 更稳。"}),
                 "采样缓冲像素": ("INT", {"default": 64, "min": 0, "max": 2048, "step": 8, "tooltip": "中心写回区外额外允许采样的一圈 halo；参与 denoise 但不写回。"}),
-                "采样方式": (cls.sampling_styles, {"default": "latent分块", "tooltip": "latent分块是原有高速路径；细化器式分块会像面部细化节点一样先裁图像上下文、用羽化遮罩采样，再把中心块羽化贴回，普通版专用。"}),
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。"}),
                 "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1。"}),
@@ -1106,7 +1049,6 @@ class L13RedrawSettings:
         重叠像素,
         上下文像素,
         采样缓冲像素,
-        采样方式,
         融合方式,
         图像缩放算法,
         重绘轮数,
@@ -1136,7 +1078,6 @@ class L13RedrawSettings:
             "重叠像素": 重叠像素,
             "上下文像素": 上下文像素,
             "采样缓冲像素": 采样缓冲像素,
-            "采样方式": 采样方式,
             "融合方式": 融合方式,
             "图像缩放算法": 图像缩放算法,
             "重绘轮数": 重绘轮数,
@@ -2248,180 +2189,6 @@ class L13ContextMaskedRedraw8K:
             force_full_denoise=force_full_denoise,
         )
 
-    def _run_detailer_style_stage(
-        self,
-        model,
-        vae,
-        pixel_canvas,
-        base,
-        global_noise,
-        detail_noise,
-        protect_mask,
-        stage_regions,
-        positive,
-        negative,
-        seed,
-        total_steps,
-        cfg,
-        sampler_name,
-        scheduler,
-        stage_denoise,
-        tiles,
-        height,
-        width,
-        stage_width,
-        stage_height,
-        overlap,
-        context,
-        sample_halo,
-        blend,
-        scale,
-        disable_noise,
-        start_step,
-        last_step,
-        force_full_denoise,
-        stage_steps,
-        reference_hold,
-        detail_strength,
-        detail_noise_stage,
-        subject_cap,
-        background_multiplier,
-        subject_threshold,
-        subject_protect_strength,
-        color_stability_strength,
-    ):
-        pixel_canvas = pixel_canvas[:, :, :, :3].clone()
-        for tile in tiles:
-            y0, y1, x0, x1 = tile
-            sy0 = max(0, y0 - sample_halo)
-            sy1 = min(height, y1 + sample_halo)
-            sx0 = max(0, x0 - sample_halo)
-            sx1 = min(width, x1 + sample_halo)
-            cy0 = max(0, sy0 - context)
-            cy1 = min(height, sy1 + context)
-            cx0 = max(0, sx0 - context)
-            cx1 = min(width, sx1 + context)
-
-            py0, py1 = y0 * scale, y1 * scale
-            px0, px1 = x0 * scale, x1 * scale
-            pcy0, pcy1 = cy0 * scale, cy1 * scale
-            pcx0, pcx1 = cx0 * scale, cx1 * scale
-
-            crop_pixels = pixel_canvas[:, pcy0:pcy1, pcx0:pcx1, :].clone()
-            context_latent = _vae_encode_pixels(vae, crop_pixels)
-            context_latent = comfy.sample.fix_empty_latent_channels(model, context_latent)
-            crop_h = int(context_latent.shape[-2])
-            crop_w = int(context_latent.shape[-1])
-
-            if disable_noise:
-                context_noise = torch.zeros(context_latent.size(), dtype=context_latent.dtype, layout=context_latent.layout, device="cpu")
-            else:
-                context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
-                if context_noise.shape[-2:] != context_latent.shape[-2:]:
-                    context_noise = torch.nn.functional.interpolate(
-                        context_noise.float(),
-                        size=context_latent.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    ).to(dtype=context_latent.dtype)
-
-            inner = (y0 - cy0, y1 - cy0, x0 - cx0, x1 - cx0)
-            sample = (sy0 - cy0, sy1 - cy0, sx0 - cx0, sx1 - cx0)
-            mask_feather = max(0, int(sample_halo))
-            noise_mask = _soft_sample_mask_from_rects(
-                context_latent.shape[0],
-                crop_h,
-                crop_w,
-                inner,
-                sample,
-                mask_feather,
-                context_latent.device,
-                context_latent.dtype,
-            )
-
-            effective_denoise = float(stage_denoise)
-            if protect_mask is not None:
-                subject_ratio = float(protect_mask[:, :, y0:y1, x0:x1].mean().item())
-                if subject_ratio >= float(subject_threshold):
-                    effective_denoise = min(effective_denoise, float(subject_cap))
-                else:
-                    effective_denoise = min(1.0, effective_denoise * float(background_multiplier))
-                if subject_protect_strength > 0:
-                    local_protect = protect_mask[:, :, cy0:cy1, cx0:cx1].to(device=noise_mask.device, dtype=noise_mask.dtype)
-                    noise_mask = noise_mask * (1.0 - local_protect * float(subject_protect_strength))
-
-            if detail_noise is not None and detail_noise_stage in ("采样前", "两者"):
-                local_detail = detail_noise[:, :, cy0:cy1, cx0:cx1].to(device=context_latent.device, dtype=context_latent.dtype)
-                context_latent = context_latent + local_detail * noise_mask.to(device=context_latent.device, dtype=context_latent.dtype) * float(detail_strength)
-
-            tile_positive = _tile_conditioning(positive, cy0, cy1, cx0, cx1, height, width, context_latent.device, context_latent.dtype)
-            tile_negative = _tile_conditioning(negative, cy0, cy1, cx0, cx1, height, width, context_latent.device, context_latent.dtype)
-            tile_positive = _conditioning_with_region_prompts(tile_positive, stage_regions, "positive", cy0, cy1, cx0, cx1)
-            tile_negative = _conditioning_with_region_prompts(tile_negative, stage_regions, "negative", cy0, cy1, cx0, cx1)
-
-            callback = latent_preview.prepare_callback(model, stage_steps)
-            out_context = self._sample_tile(
-                model,
-                tile_positive,
-                tile_negative,
-                context_latent,
-                context_noise,
-                noise_mask,
-                int(seed),
-                total_steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                effective_denoise,
-                not comfy.utils.PROGRESS_BAR_ENABLED,
-                disable_noise=disable_noise,
-                start_step=start_step,
-                last_step=last_step,
-                force_full_denoise=force_full_denoise,
-                callback=callback,
-            )
-
-            iy0, iy1, ix0, ix1 = inner
-            out_context = out_context.clone()
-            out_tile = out_context[:, :, iy0:iy1, ix0:ix1]
-            base_tile = base[:, :, y0:y1, x0:x1]
-            compatibility_hold = max(0.0, min(1.0, float(color_stability_strength))) * 0.08
-            out_tile = _blend_reference_latent(out_tile, base_tile, max(0.0, min(0.8, float(reference_hold) + compatibility_hold)))
-            if detail_noise is not None and detail_noise_stage in ("写回前", "两者"):
-                local_detail = detail_noise[:, :, y0:y1, x0:x1].to(device=out_tile.device, dtype=out_tile.dtype)
-                detail_mask = torch.ones((out_tile.shape[0], 1, y1 - y0, x1 - x0), device=out_tile.device, dtype=out_tile.dtype)
-                if protect_mask is not None and subject_protect_strength > 0:
-                    local_protect = protect_mask[:, :, y0:y1, x0:x1].to(device=out_tile.device, dtype=out_tile.dtype)
-                    detail_mask = detail_mask * (1.0 - local_protect * float(subject_protect_strength))
-                out_tile = out_tile + local_detail * detail_mask * float(detail_strength) * 0.5
-            out_context[:, :, iy0:iy1, ix0:ix1] = out_tile
-
-            out_pixels = _vae_decode_latent(vae, out_context)
-            crop_h_px = int(crop_pixels.shape[1])
-            crop_w_px = int(crop_pixels.shape[2])
-            if out_pixels.shape[1] != crop_h_px or out_pixels.shape[2] != crop_w_px:
-                out_pixels = _scale_pixels(out_pixels, crop_w_px, crop_h_px, "bilinear")
-
-            piy0, piy1 = py0 - pcy0, py1 - pcy0
-            pix0, pix1 = px0 - pcx0, px1 - pcx0
-            out_patch = out_pixels[:, piy0:piy1, pix0:pix1, :]
-            paste_weight = _tile_weight(
-                py1 - py0,
-                px1 - px0,
-                stage_height,
-                stage_width,
-                py0,
-                py1,
-                px0,
-                px1,
-                overlap * scale,
-                blend,
-                pixel_canvas.device,
-                pixel_canvas.dtype,
-            )
-            pixel_canvas = _paste_pixels_with_mask(pixel_canvas, out_patch, paste_weight, py0, px0)
-        return pixel_canvas
-
     def _run_redraw(
         self,
         模型,
@@ -2480,7 +2247,6 @@ class L13ContextMaskedRedraw8K:
         线稿模型补丁=None,
         线稿控制="禁用",
         线稿强度=0.35,
-        采样方式="latent分块",
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -2516,9 +2282,6 @@ class L13ContextMaskedRedraw8K:
             接缝修复强度 = setting("接缝修复强度", 接缝修复强度)
             接缝宽度 = setting("接缝宽度", 接缝宽度)
             主体保护强度 = setting("主体保护强度", 主体保护强度)
-            采样方式 = setting("采样方式", 采样方式)
-
-        采样方式 = 采样方式 if 采样方式 in SAMPLING_STYLE_CHOICES else "latent分块"
 
         line_control_enabled = 高级采样器逻辑 and 线稿控制 != "禁用" and float(线稿强度) != 0.0
         if line_control_enabled and 线稿模型补丁 is None:
@@ -2671,55 +2434,6 @@ class L13ContextMaskedRedraw8K:
                 protect_mask = protect_mask.clamp(0.0, 1.0)
 
             stage_regions = _prepare_stage_regions(区域提示词, width, height, scale, canvas.device, canvas.dtype)
-
-            if not 高级采样器逻辑 and 采样方式 == "细化器式分块":
-                pixel_canvas = _scale_pixels(stage_source_pixels, stage_width, stage_height, 图像缩放算法)
-                for pass_index in range(pass_count):
-                    pixel_canvas = self._run_detailer_style_stage(
-                        模型,
-                        VAE,
-                        pixel_canvas,
-                        base,
-                        global_noise,
-                        detail_noise,
-                        protect_mask,
-                        stage_regions,
-                        正向条件,
-                        负向条件,
-                        噪声种子,
-                        总步数,
-                        CFG引导,
-                        采样器,
-                        调度器,
-                        stage_denoise,
-                        tiles,
-                        height,
-                        width,
-                        stage_width,
-                        stage_height,
-                        overlap,
-                        context,
-                        sample_halo,
-                        blend,
-                        scale,
-                        disable_noise,
-                        stage_start_step,
-                        stage_end_step,
-                        force_full_denoise,
-                        stage_steps,
-                        参考保留强度,
-                        细节扰动,
-                        细节噪声位置,
-                        主体重绘上限,
-                        背景重绘倍率,
-                        主体判断阈值,
-                        主体保护强度,
-                        色彩稳定强度,
-                    )
-                canvas = comfy.sample.fix_empty_latent_channels(模型, _vae_encode_pixels(VAE, pixel_canvas))
-                if stage_index < stage_count - 1:
-                    current_pixels = _sharpen_pixels(pixel_canvas, 0.08, 3)
-                continue
 
             for pass_index in range(pass_count):
                 accum = torch.zeros_like(canvas)
@@ -2994,7 +2708,6 @@ class L13ContextMaskedRedraw8K:
             主体保护遮罩=_param(kwargs, "主体保护遮罩", default=None),
             主体保护强度=_param(kwargs, "主体保护强度", default=0.55),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
-            采样方式=_param(kwargs, "采样方式", default="latent分块"),
         )
 
 

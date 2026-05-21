@@ -223,7 +223,10 @@ def _patch_model_with_l13_control(model, model_patch, vae, image: torch.Tensor, 
         from comfy_extras.nodes_model_patch import QwenImageDiffsynthControlnet
         return QwenImageDiffsynthControlnet().diffsynth_controlnet(model, model_patch, vae, image[:, :, :, :3], float(strength))[0]
     except Exception as exc:
-        raise RuntimeError(f"L13 线稿控制应用 MODEL_PATCH 失败：{exc}") from exc
+        if exc.__class__.__name__ == "InterruptProcessingException":
+            raise
+        detail = str(exc).strip() or exc.__class__.__name__
+        raise RuntimeError(f"L13 线稿控制应用 MODEL_PATCH 失败：{detail}") from exc
 
 
 def _sharpen_pixels(pixels: torch.Tensor, strength: float = 0.0, kernel_size: int = 3) -> torch.Tensor:

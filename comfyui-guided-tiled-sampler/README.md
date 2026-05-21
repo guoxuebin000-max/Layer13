@@ -97,6 +97,8 @@ This is deliberately simpler than LG Noise Injection's model-level CFG feature i
 
 For automatic regional prompts, use `L13 视觉区域规划提示词` with any vision-language node that can read an image and return text. Feed its `视觉模型提示词` to the VLM prompt input and the first-pass image to the VLM image input. Connect the VLM text output to `L13 视觉区域JSON转提示词 -> 视觉模型JSON`, connect the same first-pass image to `参考图像`, then connect `区域提示词` to the redraw node. The expected VLM output is JSON with normalized `bbox` values in `x0,y0,x1,y1` order plus `positive`, `negative`, `strength`, and `feather` fields. The converter also returns a combined `区域遮罩` and `解析摘要` for checking what it found.
 
+`L13 视觉区域规划提示词` intentionally avoids literal JSON braces in its prompt template so nodes such as `JoyCaptionBeta1`, which internally call Python `str.format`, do not crash on JSON examples before the vision model runs.
+
 `接缝修复` runs only on the final stage. It creates a seam mask along tile boundaries and performs one low-denoise masked redraw pass there, then writes only the seam areas back with the normal feather accumulation. Keep it off unless visible seams remain.
 
 `递进放大模式` creates intermediate canvases before the final size. It now only has `开启` and `关闭`. When enabled, it steps by about `2048px` on the short edge while keeping the reference aspect ratio. Between stages, the node decodes the current latent to pixels, scales to the next stage, VAE-encodes again, then performs the same context-masked tile redraw. This avoids relying on one large latent interpolation jump.

@@ -1422,19 +1422,14 @@ Use normalized bbox coordinates in x0,y0,x1,y1 format, values from 0 to 1.
 Focus on: {focus}.
 {safety}
 
-Schema:
-{{
-  "regions": [
-    {{
-      "name": "short region name",
-      "bbox": [0.0, 0.0, 1.0, 1.0],
-      "positive": "local prompt for this region, detail/style/texture only",
-      "negative": "local negative prompt for this region",
-      "strength": 0.8,
-      "feather": 32
-    }}
-  ]
-}}
+Required JSON structure:
+- The top-level value must be one JSON object.
+- The top-level object must contain a key named regions.
+- The regions value must be an array.
+- Each array item must be an object with these keys:
+  name, bbox, positive, negative, strength, feather.
+- bbox must be an array of four numbers in this order: x0, y0, x1, y1.
+- positive and negative must be plain strings.
 
 Rules:
 - Do not invent objects not visible in the image.
@@ -1442,6 +1437,7 @@ Rules:
 - For one-person images, mark only one main_subject region and discourage duplicates in negative.
 - Use strengths between 0.4 and 1.2.
 - Use feather between 16 and 96.
+- Your actual output must be parseable JSON, not this bullet list.
 """
         if 基础提示词.strip():
             prompt += f"\nGlobal prompt context:\n{基础提示词.strip()}\n"

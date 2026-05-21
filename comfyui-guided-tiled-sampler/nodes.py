@@ -35,7 +35,6 @@ ENABLE_CHOICES = ["启用", "禁用"]
 COLOR_MATCH_METHOD_CHOICES = ["RGB均值方差", "YCbCr色度", "低频颜色迁移"]
 DETAIL_NOISE_MODE_CHOICES = ["高频", "细颗粒", "多尺度", "参考纹理", "像素颗粒", "关闭"]
 DETAIL_NOISE_STAGE_CHOICES = ["采样前", "写回前", "两者"]
-IMAGE_OUTPUT_MODE_CHOICES = ["颜色迁移", "保留采样细节"]
 REGION_SCOPE_CHOICES = ["遮罩范围", "整块上下文"]
 REGION_BOX_FORMAT_CHOICES = ["自动", "x0y0x1y1", "xywh"]
 VISUAL_REGION_MODE_CHOICES = ["人物主体", "通用照片", "背景材质", "建筑空间"]
@@ -922,44 +921,6 @@ def _latent_lowpass(samples: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return low.to(dtype=samples.dtype)
 
 
-def _make_detail_residual_latent(canvas: torch.Tensor, base: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    try:
-        if canvas.ndim != 4 or base.ndim != 4:
-            return torch.zeros_like(canvas)
-        ref = base.to(device=canvas.device, dtype=canvas.dtype)
-        if ref.shape[-2:] != canvas.shape[-2:]:
-            ref = torch.nn.functional.interpolate(
-                ref.float(),
-                size=canvas.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).to(device=canvas.device, dtype=canvas.dtype)
-        if ref.shape[0] != canvas.shape[0]:
-            ref = ref[:1].expand(canvas.shape[0], -1, -1, -1) if ref.shape[0] == 1 else ref[:canvas.shape[0]]
-        if ref.shape[1] != canvas.shape[1]:
-            return torch.zeros_like(canvas)
-
-        kernel_size = max(1, int(kernel_size))
-        base_low = _latent_lowpass(ref, kernel_size)
-        canvas_low = _latent_lowpass(canvas, kernel_size)
-        base_high = ref - base_low
-        canvas_high = canvas - canvas_low
-        return (canvas_high - base_high).to(device=canvas.device, dtype=canvas.dtype)
-    except Exception:
-        return torch.zeros_like(canvas)
-
-
-def _enhance_latent_detail_frequency(canvas: torch.Tensor, base: torch.Tensor, strength: float, kernel_size: int) -> torch.Tensor:
-    strength = max(0.0, min(0.35, float(strength)))
-    if strength <= 0.0:
-        return canvas
-    try:
-        detail_residual = _make_detail_residual_latent(canvas, base, kernel_size)
-        return (canvas + detail_residual * strength).to(device=canvas.device, dtype=canvas.dtype)
-    except Exception:
-        return canvas
-
-
 def _lock_structure_latent(samples: torch.Tensor, reference: torch.Tensor, strength: float, kernel_size: int) -> torch.Tensor:
     strength = max(0.0, min(1.0, float(strength)))
     if strength <= 0.0 or samples.ndim != 4 or reference.ndim != 4:
@@ -982,7 +943,6 @@ class L13RedrawSettings:
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
     detail_noise_stages = DETAIL_NOISE_STAGE_CHOICES
-    image_output_modes = IMAGE_OUTPUT_MODE_CHOICES
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1014,7 +974,6 @@ class L13RedrawSettings:
                 "接缝宽度": ("INT", {"default": 96, "min": 0, "max": 1024, "step": 8, "tooltip": "接缝修复 mask 的像素宽度。"}),
                 "主体保护强度": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "主体保护遮罩的强度。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入 KSampler 初始噪声，类似 KleinTiled 的 latent_blend 噪声引导。0 关闭；建议 0.08-0.25。"}),
-                "图像输出模式": (cls.image_output_modes, {"default": "颜色迁移", "tooltip": "颜色迁移会在最终图像上按参考图做低频颜色迁移；保留采样细节会跳过颜色迁移，并在 decode 前轻微增强采样产生的高频细节。"}),
             }
         }
 
@@ -1052,7 +1011,6 @@ class L13RedrawSettings:
         接缝宽度,
         主体保护强度,
         参考噪声强度,
-        图像输出模式="颜色迁移",
     ):
         return ({
             "目标宽度": 目标宽度,
@@ -1081,7 +1039,6 @@ class L13RedrawSettings:
             "接缝修复强度": 接缝修复强度,
             "接缝宽度": 接缝宽度,
             "主体保护强度": 主体保护强度,
-            "图像输出模式": 图像输出模式,
         },)
 
 
@@ -1092,7 +1049,6 @@ class L13AdvancedRedrawSettings:
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
     detail_noise_stages = DETAIL_NOISE_STAGE_CHOICES
     advanced_step_modes = ADVANCED_STEP_MODE_CHOICES
-    image_output_modes = IMAGE_OUTPUT_MODE_CHOICES
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1117,7 +1073,6 @@ class L13AdvancedRedrawSettings:
                 "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入初始噪声。高级版建议更低，0.06-0.18。"}),
-                "图像输出模式": (cls.image_output_modes, {"default": "颜色迁移", "tooltip": "颜色迁移会在最终图像上按参考图做低频颜色迁移；保留采样细节会跳过颜色迁移，并在 decode 前轻微增强采样产生的高频细节。"}),
             }
         }
 
@@ -1148,7 +1103,6 @@ class L13AdvancedRedrawSettings:
         分块顺序,
         最大分块数,
         参考噪声强度,
-        图像输出模式="颜色迁移",
     ):
         return ({
             "目标宽度": 目标宽度,
@@ -1170,7 +1124,6 @@ class L13AdvancedRedrawSettings:
             "图像缩放算法": 图像缩放算法,
             "分块顺序": 分块顺序,
             "最大分块数": 最大分块数,
-            "图像输出模式": 图像输出模式,
         },)
 
 
@@ -2242,7 +2195,6 @@ class L13ContextMaskedRedraw8K:
         结构锁定尺度=64,
         递进步数模式="固定起止步",
         区域提示词=None,
-        图像输出模式="颜色迁移",
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -2278,7 +2230,6 @@ class L13ContextMaskedRedraw8K:
             接缝修复强度 = setting("接缝修复强度", 接缝修复强度)
             接缝宽度 = setting("接缝宽度", 接缝宽度)
             主体保护强度 = setting("主体保护强度", 主体保护强度)
-            图像输出模式 = setting("图像输出模式", 图像输出模式)
 
         blend = BLEND_MAP[融合方式]
         add_noise = ADD_NOISE_MAP[加噪]
@@ -2625,20 +2576,10 @@ class L13ContextMaskedRedraw8K:
             if stage_index < stage_count - 1:
                 current_pixels = _sharpen_pixels(_vae_decode_latent(VAE, canvas), 0.08, 3)
 
-        reference_canvas = base if base is not None else torch.zeros_like(canvas)
-        if 图像输出模式 == "保留采样细节":
-            detail_boost = 0.0
-            if _uses_detail_noise(细节扰动, 细节噪声模式):
-                detail_boost = max(0.04, min(0.18, float(细节扰动) * 12.0))
-            detail_kernel = max(3, min(31, int(round(96 / max(1, scale)))))
-            if detail_kernel % 2 == 0:
-                detail_kernel = max(3, detail_kernel - 1)
-            canvas = _enhance_latent_detail_frequency(canvas, reference_canvas, detail_boost, detail_kernel)
-
         image = _vae_decode_latent(VAE, canvas)
-        if 图像输出模式 != "保留采样细节":
-            image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
+        image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
         final_latent = {"samples": canvas}
+        reference_canvas = base if base is not None else torch.zeros_like(canvas)
         reference_latent = {"samples": reference_canvas}
         return (
             image,
@@ -2690,7 +2631,6 @@ class L13ContextMaskedRedraw8K:
             主体保护遮罩=_param(kwargs, "主体保护遮罩", default=None),
             主体保护强度=_param(kwargs, "主体保护强度", default=0.55),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
-            图像输出模式=_param(kwargs, "图像输出模式", default="颜色迁移"),
         )
 
 
@@ -2780,7 +2720,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             结构锁定尺度=_param(kwargs, "结构锁定尺度", default=64),
             递进步数模式=_param(kwargs, "递进步数模式", default="起始步递进"),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
-            图像输出模式=_param(kwargs, "图像输出模式", default="颜色迁移"),
         )
 
 

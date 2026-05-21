@@ -2238,15 +2238,17 @@ class L13ContextMaskedRedraw8K:
         force_full_denoise = leftover_noise == "disable"
         scale = _vae_scale(VAE)
         input_latent_pixels = None
+        sampled_reference_pixels = None
         if isinstance(输入潜空间, dict) and "samples" in 输入潜空间:
             latent_samples = comfy.sample.fix_empty_latent_channels(模型, 输入潜空间["samples"])
+            input_latent_pixels = _vae_decode_latent(VAE, latent_samples)
             if 参考图像 is None:
                 native_denoise = 1.0 if 高级采样器逻辑 else float(重绘强度)
-                latent_samples = self._sample_native_reference_latent(
+                sampled_reference_latent = self._sample_native_reference_latent(
                     模型,
                     正向条件,
                     负向条件,
-                    latent_samples,
+                    latent_samples.clone(),
                     噪声种子,
                     总步数,
                     CFG引导,
@@ -2258,14 +2260,14 @@ class L13ContextMaskedRedraw8K:
                     last_step=结束步,
                     force_full_denoise=force_full_denoise,
                 )
-            input_latent_pixels = _vae_decode_latent(VAE, latent_samples)
+                sampled_reference_pixels = _vae_decode_latent(VAE, sampled_reference_latent)
 
         reference_pixels = 参考图像
         if reference_pixels is None:
-            if input_latent_pixels is not None:
-                reference_pixels = input_latent_pixels
+            if sampled_reference_pixels is not None:
+                reference_pixels = sampled_reference_pixels
             else:
-                raise RuntimeError("L13 参考重绘放大需要连接 参考图像；如果不接参考图像，则必须连接不带噪的 输入潜空间 作为参考来源。")
+                raise RuntimeError("L13 参考重绘放大需要连接 参考图像；如果不接参考图像，则必须连接 输入latent 作为参考来源。")
 
         pass_count = max(1, int(重绘轮数))
         safety_enabled = _enabled(人物安全模式)
@@ -2644,7 +2646,6 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             "required": {
                 "模型": ("MODEL", {"tooltip": "用于局部重绘的扩散模型。高级版使用 KSampler Advanced 的起止步逻辑。"}),
                 "VAE": ("VAE", {"tooltip": "用于把参考图像编码成高分辨率 latent，以及 8K tiled VAE encode/decode。"}),
-                "参考图像": ("IMAGE", {"tooltip": "第一段完整构图图像。高级版会把它作为固定参考锚点，缩放并编码成高分辨率 latent 后按 KSampler Advanced 起止步分块重绘。"}),
                 "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
                 "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
                 "步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "完整采样时间线的步数。高级分段时每一段都填同一个步数。"}),
@@ -2660,6 +2661,8 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
             },
             "optional": {
+                "参考图像": ("IMAGE", {"tooltip": "可选。和输入latent至少连接一个。连接时会优先作为全局参考锚点；没连接时，节点会用输入latent原尺寸采样一遍生成参考图。"}),
+                "输入latent": ("LATENT", {"tooltip": "可选。和参考图像至少连接一个。连接时会先解码为第一阶段底图；没接参考图像时，会复制这份 latent 原尺寸采样一遍并解码成全局参考图。"}),
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
                 "区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。连接 L13 区域提示词 后，节点会在每个递进阶段缩放区域遮罩，并自动裁进每个 tile。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
@@ -2672,7 +2675,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
         return self._run_redraw(
             _param(kwargs, "模型", "model"),
             _param(kwargs, "VAE", "vae"),
-            _param(kwargs, "参考图像", "reference_image"),
+            _param(kwargs, "参考图像", "reference_image", default=None),
             _param(kwargs, "正向条件", "positive"),
             _param(kwargs, "负向条件", "negative"),
             _param(kwargs, "噪声种子", "noise_seed"),
@@ -2712,6 +2715,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             结束步=_param(kwargs, "结束步", "end_at_step"),
             保留剩余噪声=_param(kwargs, "保留剩余噪声", "return_with_leftover_noise"),
             高级参数=_param(kwargs, "高级参数", default=None),
+            输入潜空间=_param(kwargs, "输入latent", "输入潜空间", "latent_image", default=None),
             区域提示词=_param(kwargs, "区域提示词", default=None),
             主体保护遮罩=_param(kwargs, "主体保护遮罩", default=None),
             主体保护强度=_param(kwargs, "主体保护强度", default=0.55),

@@ -119,15 +119,17 @@ Unlike the normal node, the advanced node has no `降噪` input. It keeps the sa
 
 Reference input:
 
-- The advanced node uses `参考图像` again and no longer requires `输入潜空间`.
-- The reference image is resized in pixel space and VAE-encoded into the high-resolution latent canvas.
+- The advanced node can use `参考图像`, `输入latent`, or both.
+- When `参考图像` is connected, it is the global reference anchor. If `输入latent` is also connected, the latent is decoded only as the first-stage base image.
+- When `参考图像` is not connected, `输入latent` is required. The node copies that latent, runs the selected original-size KSampler Advanced segment once, decodes that result as the global reference image, then uses the original decoded latent as the first-stage base image for progressive tiled redraw.
+- The selected reference image is resized in pixel space and VAE-encoded into the high-resolution latent canvas.
 - The advanced redraw node no longer directly upscales latent tensors. This avoids the colored-noise artifacts caused by resizing noisy latent data.
 - During tile writeback, advanced mode applies `结构锁定` against that high-resolution internal reference latent. It locks low-frequency structure and now also mixes back a small amount of the reference latent based on the same strength, which helps suppress duplicated bodies when the sampler tries to reinterpret a tile.
 - Advanced mode also applies internal latent color matching at fixed strength `1.0` against the same high-resolution internal reference latent before each tile is written back. This matches the color/contrast statistics of the reference result instead of letting each tile drift.
 
 The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 起始步递进`, every size stage keeps the same `结束步`, while later stages move `起始步` forward. For example, `起始步=4`, `结束步=12`: two size stages run `4-12`, `8-12`; three size stages run `4-12`, `7-12`, `10-12`. `随尺寸递进` keeps the old split behavior, dividing `起始步 -> 结束步` into continuous stage windows such as `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
-`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, `参考保留强度`, and image output mode. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
+`L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
 
 For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
 

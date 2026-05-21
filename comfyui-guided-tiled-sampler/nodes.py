@@ -38,6 +38,7 @@ DETAIL_NOISE_STAGE_CHOICES = ["采样前", "写回前", "两者"]
 REGION_SCOPE_CHOICES = ["遮罩范围", "整块上下文"]
 REGION_BOX_FORMAT_CHOICES = ["自动", "x0y0x1y1", "xywh"]
 VISUAL_REGION_MODE_CHOICES = ["人物主体", "通用照片", "背景材质", "建筑空间"]
+LINE_CONTROL_MODE_CHOICES = ["禁用", "线稿", "明度"]
 TARGET_SIZE_LONG_EDGE = {
     "自定义": None,
     "2K": 2048,
@@ -174,6 +175,55 @@ def _scale_pixels(pixels: torch.Tensor, width: int, height: int, method: str) ->
     pixels = pixels[:, :, :, :3]
     scaled = comfy.utils.common_upscale(pixels.movedim(-1, 1), width, height, method, "disabled")
     return scaled.movedim(1, -1)
+
+
+def _image_luma_nchw(pixels: torch.Tensor) -> torch.Tensor:
+    rgb = pixels[:, :, :, :3].clamp(0.0, 1.0).movedim(-1, 1).float()
+    return rgb[:, 0:1] * 0.299 + rgb[:, 1:2] * 0.587 + rgb[:, 2:3] * 0.114
+
+
+def _lightweight_line_control_image(pixels: torch.Tensor, mode: str) -> Optional[torch.Tensor]:
+    if mode == "禁用" or pixels.ndim != 4:
+        return None
+    luma = _image_luma_nchw(pixels)
+    if mode == "明度":
+        return luma.repeat(1, 3, 1, 1).movedim(1, -1).to(dtype=pixels.dtype)
+
+    h, w = int(luma.shape[-2]), int(luma.shape[-1])
+    if h < 3 or w < 3:
+        return luma.repeat(1, 3, 1, 1).movedim(1, -1).to(dtype=pixels.dtype)
+
+    blurred = torch.nn.functional.avg_pool2d(torch.nn.functional.pad(luma, (1, 1, 1, 1), mode="replicate"), 3, stride=1)
+    kx = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=blurred.device,
+        dtype=blurred.dtype,
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=blurred.device,
+        dtype=blurred.dtype,
+    ).view(1, 1, 3, 3)
+    gx = torch.nn.functional.conv2d(torch.nn.functional.pad(blurred, (1, 1, 1, 1), mode="replicate"), kx)
+    gy = torch.nn.functional.conv2d(torch.nn.functional.pad(blurred, (1, 1, 1, 1), mode="replicate"), ky)
+    mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+    flat = mag.flatten(1)
+    maxv = flat.amax(dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
+    edge = (mag / maxv).clamp(0.0, 1.0)
+    edge = ((edge - 0.10) / 0.22).clamp(0.0, 1.0)
+    edge = torch.nn.functional.max_pool2d(edge, kernel_size=3, stride=1, padding=1)
+    line = (1.0 - edge).clamp(0.0, 1.0)
+    return line.repeat(1, 3, 1, 1).movedim(1, -1).to(dtype=pixels.dtype)
+
+
+def _patch_model_with_l13_control(model, model_patch, vae, image: torch.Tensor, strength: float):
+    if model_patch is None or image is None or float(strength) == 0.0:
+        return model
+    try:
+        from comfy_extras.nodes_model_patch import QwenImageDiffsynthControlnet
+        return QwenImageDiffsynthControlnet().diffsynth_controlnet(model, model_patch, vae, image[:, :, :, :3], float(strength))[0]
+    except Exception as exc:
+        raise RuntimeError(f"L13 线稿控制应用 MODEL_PATCH 失败：{exc}") from exc
 
 
 def _sharpen_pixels(pixels: torch.Tensor, strength: float = 0.0, kernel_size: int = 3) -> torch.Tensor:
@@ -2195,6 +2245,9 @@ class L13ContextMaskedRedraw8K:
         结构锁定尺度=64,
         递进步数模式="固定起止步",
         区域提示词=None,
+        线稿模型补丁=None,
+        线稿控制="禁用",
+        线稿强度=0.35,
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -2230,6 +2283,10 @@ class L13ContextMaskedRedraw8K:
             接缝修复强度 = setting("接缝修复强度", 接缝修复强度)
             接缝宽度 = setting("接缝宽度", 接缝宽度)
             主体保护强度 = setting("主体保护强度", 主体保护强度)
+
+        line_control_enabled = 高级采样器逻辑 and 线稿控制 != "禁用" and float(线稿强度) != 0.0
+        if line_control_enabled and 线稿模型补丁 is None:
+            raise RuntimeError("L13 线稿控制已启用，但没有连接 模型补丁。请连接 MODEL_PATCH，或把 线稿控制 设为 禁用。")
 
         blend = BLEND_MAP[融合方式]
         add_noise = ADD_NOISE_MAP[加噪]
@@ -2346,12 +2403,17 @@ class L13ContextMaskedRedraw8K:
         for stage_index, (stage_width, stage_height, height, width, tile_h, tile_w, overlap, context, sample_halo, tiles) in enumerate(stage_plans):
             stage_start_step, stage_end_step = stage_step_windows[stage_index]
             stage_steps = stage_sampler_steps[stage_index]
+            stage_source_pixels = input_latent_pixels if stage_index == 0 and input_latent_pixels is not None else current_pixels
             if stage_index == 0 and input_latent_pixels is not None:
                 base = self._build_canvas_from_pixels(VAE, input_latent_pixels, stage_width, stage_height, 图像缩放算法)
             else:
                 base = self._build_canvas_from_pixels(VAE, current_pixels, stage_width, stage_height, 图像缩放算法)
             base = comfy.sample.fix_empty_latent_channels(模型, base)
             canvas = base.clone()
+            stage_control_image = None
+            if line_control_enabled:
+                control_pixels = _scale_pixels(stage_source_pixels, stage_width, stage_height, 图像缩放算法)
+                stage_control_image = _lightweight_line_control_image(control_pixels, 线稿控制)
             stage_denoise = float(重绘强度)
             if stage_count > 1:
                 stage_denoise = max(0.01, min(1.0, stage_denoise * (decay ** stage_index)))
@@ -2426,9 +2488,16 @@ class L13ContextMaskedRedraw8K:
                     tile_negative = _tile_conditioning(负向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
                     tile_positive = _conditioning_with_region_prompts(tile_positive, stage_regions, "positive", cy0, cy1, cx0, cx1)
                     tile_negative = _conditioning_with_region_prompts(tile_negative, stage_regions, "negative", cy0, cy1, cx0, cx1)
+                    tile_model = 模型
+                    if stage_control_image is not None:
+                        py0, py1 = cy0 * scale, cy1 * scale
+                        px0, px1 = cx0 * scale, cx1 * scale
+                        control_crop = stage_control_image[:, py0:py1, px0:px1, :]
+                        tile_model = _patch_model_with_l13_control(模型, 线稿模型补丁, VAE, control_crop, 线稿强度)
 
                     return {
                         "tile": (y0, y1, x0, x1),
+                        "model": tile_model,
                         "context_latent": context_latent,
                         "context_noise": context_noise,
                         "noise_mask": noise_mask,
@@ -2467,9 +2536,10 @@ class L13ContextMaskedRedraw8K:
 
                 for tile in tiles:
                     sample_state = build_tile_state(tile)
-                    callback = latent_preview.prepare_callback(模型, stage_steps)
+                    tile_model = sample_state["model"]
+                    callback = latent_preview.prepare_callback(tile_model, stage_steps)
                     out_context = self._sample_tile(
-                        模型,
+                        tile_model,
                         sample_state["tile_positive"],
                         sample_state["tile_negative"],
                         sample_state["context_latent"],
@@ -2528,12 +2598,18 @@ class L13ContextMaskedRedraw8K:
                         tile_negative = _tile_conditioning(负向条件, cy0, cy1, cx0, cx1, height, width, canvas.device, canvas.dtype)
                         tile_positive = _conditioning_with_region_prompts(tile_positive, stage_regions, "positive", cy0, cy1, cx0, cx1)
                         tile_negative = _conditioning_with_region_prompts(tile_negative, stage_regions, "negative", cy0, cy1, cx0, cx1)
+                        tile_model = 模型
+                        if stage_control_image is not None:
+                            py0, py1 = cy0 * scale, cy1 * scale
+                            px0, px1 = cx0 * scale, cx1 * scale
+                            control_crop = stage_control_image[:, py0:py1, px0:px1, :]
+                            tile_model = _patch_model_with_l13_control(模型, 线稿模型补丁, VAE, control_crop, 线稿强度)
 
                         seam_start_step, seam_end_step = stage_step_windows[-1]
                         seam_steps = stage_sampler_steps[-1]
-                        callback = latent_preview.prepare_callback(模型, seam_steps)
+                        callback = latent_preview.prepare_callback(tile_model, seam_steps)
                         out_context = self._sample_tile(
-                            模型,
+                            tile_model,
                             tile_positive,
                             tile_negative,
                             context_latent,
@@ -2639,6 +2715,7 @@ class L13ContextMaskedRedraw8K:
 class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
     add_noise_modes = ADD_NOISE_CHOICES
     leftover_noise_modes = LEFTOVER_NOISE_CHOICES
+    line_control_modes = LINE_CONTROL_MODE_CHOICES
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2657,12 +2734,15 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "起始步": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "本段从完整采样时间线的第几步开始。比如先构图 3 步后，这里填 3。"}),
                 "结束步": ("INT", {"default": 10000, "min": 0, "max": 10000, "tooltip": "本段采样到第几步结束。最终段通常填步数。"}),
                 "保留剩余噪声": (cls.leftover_noise_modes, {"tooltip": "启用表示输出保留未采完的噪声，方便继续接下一段；最终输出通常设为禁用。"}),
+                "线稿控制": (cls.line_control_modes, {"default": "禁用", "tooltip": "高级版内置轻量控制图。线稿会从当前递进阶段参考图提取边缘；明度会使用灰度亮度图。需要在可选输入连接 MODEL_PATCH。"}),
+                "线稿强度": ("FLOAT", {"default": 0.35, "min": -10.0, "max": 10.0, "step": 0.01, "round": 0.001, "tooltip": "内部线稿/明度 MODEL_PATCH 控制强度。人物建议 0.20-0.45；建筑可更高。"}),
                 "目标规格": (cls.target_sizes, {"default": "4K", "tooltip": "2K/4K/8K 会保持参考图原比例，把长边设为 2048/4096/8192。自定义时使用目标宽高；宽高相等时也按长边保持比例。"}),
                 "递进放大模式": (cls.progressive_modes, {"default": "开启", "tooltip": "开启时按短边每次约 2048 像素递进，并保持参考图比例。配合高级参数里的递进步数模式可把起始步到结束步按阶段切开。"}),
             },
             "optional": {
                 "参考图像": ("IMAGE", {"tooltip": "可选。和输入latent至少连接一个。连接时会优先作为全局参考锚点；没连接时，节点会用输入latent原尺寸采样一遍生成参考图。"}),
                 "输入latent": ("LATENT", {"tooltip": "可选。和参考图像至少连接一个。连接时会先解码为第一阶段底图；没接参考图像时，会复制这份 latent 原尺寸采样一遍并解码成全局参考图。"}),
+                "模型补丁": ("MODEL_PATCH", {"tooltip": "可选。配合 线稿控制 使用的 ZImage/Qwen 等 MODEL_PATCH。节点会按每个 tile 的 context 裁控制图并临时 patch 模型。"}),
                 "高级参数": ("L13_ADVANCED_REDRAW_SETTINGS", {"tooltip": "可选。连接 L13 参考重绘放大参数（高级）后，只覆盖尺寸、分块、融合和预览等结构参数，不包含降噪/重绘强度。"}),
                 "区域提示词": ("L13_REGION_PROMPTS", {"tooltip": "可选。连接 L13 区域提示词 后，节点会在每个递进阶段缩放区域遮罩，并自动裁进每个 tile。"}),
                 "主体保护遮罩": ("MASK", {"tooltip": "可选。白色区域会降低中心 noise_mask 更新强度，用于保护人物主体，防止换人或复制主体。"}),
@@ -2724,6 +2804,9 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             结构锁定尺度=_param(kwargs, "结构锁定尺度", default=64),
             递进步数模式=_param(kwargs, "递进步数模式", default="起始步递进"),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
+            线稿模型补丁=_param(kwargs, "模型补丁", "model_patch", default=None),
+            线稿控制=_param(kwargs, "线稿控制", default="禁用"),
+            线稿强度=_param(kwargs, "线稿强度", default=0.35),
         )
 
 

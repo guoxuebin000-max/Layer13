@@ -129,6 +129,13 @@ Reference input:
 
 The advanced node now exposes `递进放大模式`. With `L13 参考重绘放大参数（高级） -> 递进步数模式 = 起始步递进`, every size stage keeps the same `结束步`, while later stages move `起始步` forward. For example, `起始步=4`, `结束步=12`: two size stages run `4-12`, `8-12`; three size stages run `4-12`, `7-12`, `10-12`. `随尺寸递进` keeps the old split behavior, dividing `起始步 -> 结束步` into continuous stage windows such as `0-3`, `3-6`, `6-9`, `9-12`. `固定起止步` keeps every size stage on the same KSampler Advanced segment.
 
+The advanced node can apply lightweight internal control per tile when `模型补丁` is connected:
+
+- `线稿控制 = 线稿` builds a simple edge map from the current progressive-stage reference image.
+- `线稿控制 = 明度` builds a grayscale luma control image.
+- For every tile, the node crops the current context area from that control image, temporarily applies the `MODEL_PATCH`, then samples only that tile. This keeps the control image spatially aligned with L13's internal tile/context crop.
+- This path is intended for ZImage/Qwen-style model-patch control. It does not run heavy AUX annotator models internally.
+
 `L13 参考重绘放大参数（高级）` is a separate settings node for the advanced version. It contains target size, tile size, overlap, context, sample halo, blend mode, image scaling, tile order, max tile count, detail noise controls, structure lock controls, and `参考保留强度`. It intentionally does not contain `降噪`, `重绘强度`, adaptive subject denoise, or seam repair controls.
 
 For full-step advanced redraws that still duplicate the subject, raise `结构锁定强度` from the default `0.55` toward `0.70`. If texture becomes too conservative, lower it or raise `结构锁定尺度` from `64` to `96-128` so only larger composition shapes are locked.
@@ -208,4 +215,4 @@ This is closer to native `KSampler Advanced` segmented sampling than using a com
 
 - The node supports prompt conditioning and latent composition guidance.
 - Area and mask conditioning are shifted into each tile.
-- ControlNet may work in simple cases, but tiled ControlNet hints can be spatially imperfect. Prefer using the low-resolution composition latent as the main global guide.
+- External whole-image ControlNet may work in simple cases, but tiled ControlNet hints can be spatially imperfect. For ZImage/Qwen model-patch control, prefer the advanced node's internal `线稿控制` so each tile receives a matching context crop.

@@ -2577,7 +2577,7 @@ class L13ContextMaskedRedraw8K:
                 current_pixels = _sharpen_pixels(_vae_decode_latent(VAE, canvas), 0.08, 3)
 
         image = _vae_decode_latent(VAE, canvas)
-        image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
+        image = _match_image_color(image, reference_pixels, 0.75, "低频颜色迁移")
         final_latent = {"samples": canvas}
         reference_canvas = base if base is not None else torch.zeros_like(canvas)
         reference_latent = {"samples": reference_canvas}

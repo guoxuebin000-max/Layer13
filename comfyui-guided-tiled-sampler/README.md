@@ -73,7 +73,7 @@ Preview is handled by ComfyUI's built-in sampler preview system. There is no nod
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
 
-The redraw nodes always decode with tiled VAE, then color-match the result against the reference image with low-frequency color transfer at strength 1.0.
+The redraw nodes always decode with tiled VAE, then color-match the result against the reference image with low-frequency color transfer at strength 0.75.
 
 The normal and advanced redraw nodes output three values:
 

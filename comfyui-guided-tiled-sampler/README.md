@@ -49,7 +49,7 @@ This is the safer path for人物主体图. It does not directly upscale low-reso
 Recommended人物 8K defaults:
 
 - `目标规格`: `4K` by default; switch to `8K` after the 4K settings are stable.
-- `步数`: `10`
+- `步数`: `8`
 - `降噪`: `0.22` by default; raise toward `0.35 - 0.45` only when you need stronger redraw/detail.
 - `CFG引导`: `1.0` by default for reference-anchored redraw; raise only if the prompt is too weak.
 - `采样器` / `调度器`: `euler` / `ddim_uniform`
@@ -57,7 +57,8 @@ Recommended人物 8K defaults:
 - `重叠像素`: `128` by default; raise to `192 - 256` if seams appear.
 - `上下文像素`: `256` by default; raise to `384 - 512` if local redraw loses context.
 - `采样缓冲像素`: `64` by default; raise to `96 - 160` for smoother masked edges.
-- `重绘轮数`: `1`
+- `重绘轮数`: `2`
+- `多轮强度递减`: `0.5`; second and later redraw rounds reduce denoise instead of reducing step count, so the extra pass is a lighter refinement rather than a shorter coarse resample.
 - `细节扰动`: `0.008` by default for the normal node, `0.006` for the advanced node. Lower it to `0` for maximum smoothness, or raise carefully toward `0.015 - 0.03` for stronger material texture.
 - `细节噪声模式`: `多尺度` is the default because it preserves material variation better than plain high-frequency grain; `参考纹理` boosts high-frequency texture already present in the reference latent; `像素颗粒` is harsher and should use very low strength.
 - `细节噪声位置`: `采样前` lets the sampler absorb the texture naturally; `写回前` directly adds pixel-like grain before tile blending; `两者` is stronger and should be used cautiously.
@@ -71,7 +72,7 @@ Recommended人物 8K defaults:
 
 Preview is handled by ComfyUI's built-in sampler preview system. There is no node-level preview mode; use the normal ComfyUI preview/progress settings to enable or disable sampler previews.
 
-The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, and seam repair settings.
+The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, redraw rounds, multi-round denoise decay, reference retention, subject denoise cap, background multiplier, and seam repair settings. Tile order is fixed to serpentine to reduce row-boundary jumps without adding another visible parameter.
 
 The redraw nodes always decode with tiled VAE, then color-match the result against the reference image with low-frequency color transfer at strength 0.75.
 

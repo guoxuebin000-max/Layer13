@@ -992,7 +992,6 @@ def _lock_structure_latent(samples: torch.Tensor, reference: torch.Tensor, stren
 
 class L13RedrawSettings:
     blend_modes = BLEND_CHOICES
-    tile_orders = TILE_ORDER_CHOICES
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
     detail_noise_stages = DETAIL_NOISE_STAGE_CHOICES
@@ -1014,8 +1013,8 @@ class L13RedrawSettings:
                 "采样缓冲像素": ("INT", {"default": 64, "min": 0, "max": 2048, "step": 8, "tooltip": "中心写回区外额外允许采样的一圈 halo；参与 denoise 但不写回。"}),
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把第一段参考图像缩放到目标尺寸时使用的算法。"}),
-                "重绘轮数": ("INT", {"default": 1, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。人物建议 1。"}),
-                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
+                "重绘轮数": ("INT", {"default": 2, "min": 1, "max": 4, "tooltip": "完整 tile pass 次数。默认 2 轮，第二轮默认使用较低降噪轻修。"}),
+                "多轮强度递减": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "round": 0.001, "tooltip": "重绘轮数大于 1 时，每轮降噪强度相对上一轮的乘数。0.5 表示第二轮用一半降噪，第三轮再减半。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "色彩稳定强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "兼容旧工作流的轻量保色参数；建议保持 0。"}),
                 "参考保留强度": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.8, "step": 0.01, "round": 0.001, "tooltip": "采样后只把参考 latent 的低频结构混回输出。默认较低，避免抹掉新生成纹理。"}),
@@ -1052,7 +1051,7 @@ class L13RedrawSettings:
         融合方式,
         图像缩放算法,
         重绘轮数,
-        分块顺序,
+        多轮强度递减,
         最大分块数,
         色彩稳定强度,
         参考保留强度,
@@ -1081,7 +1080,7 @@ class L13RedrawSettings:
             "融合方式": 融合方式,
             "图像缩放算法": 图像缩放算法,
             "重绘轮数": 重绘轮数,
-            "分块顺序": 分块顺序,
+            "多轮强度递减": 多轮强度递减,
             "最大分块数": 最大分块数,
             "色彩稳定强度": 色彩稳定强度,
             "参考保留强度": 参考保留强度,
@@ -1097,7 +1096,6 @@ class L13RedrawSettings:
 
 class L13AdvancedRedrawSettings:
     blend_modes = BLEND_CHOICES
-    tile_orders = TILE_ORDER_CHOICES
     image_upscale_methods = ["lanczos", "bicubic", "bilinear", "nearest-exact", "area"]
     detail_noise_modes = DETAIL_NOISE_MODE_CHOICES
     detail_noise_stages = DETAIL_NOISE_STAGE_CHOICES
@@ -1123,7 +1121,6 @@ class L13AdvancedRedrawSettings:
                 "采样缓冲像素": ("INT", {"default": 64, "min": 0, "max": 2048, "step": 8, "tooltip": "中心写回区外额外允许采样的一圈 halo；参与采样但不写回。"}),
                 "融合方式": (cls.blend_modes, {"tooltip": "写回中心 tile 时的 feather 权重。"}),
                 "图像缩放算法": (cls.image_upscale_methods, {"tooltip": "把参考图像缩放到目标尺寸时使用的算法。"}),
-                "分块顺序": (cls.tile_orders, {"tooltip": "tile 处理顺序。"}),
                 "最大分块数": ("INT", {"default": 4096, "min": 0, "max": 65536, "tooltip": "安全限制。预计 tile 数超过此值会报错，0 表示不限制。"}),
                 "参考噪声强度": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.001, "tooltip": "把参考 latent 的结构方向混入初始噪声。高级版建议更低，0.06-0.18。"}),
             }
@@ -1153,7 +1150,6 @@ class L13AdvancedRedrawSettings:
         采样缓冲像素,
         融合方式,
         图像缩放算法,
-        分块顺序,
         最大分块数,
         参考噪声强度,
     ):
@@ -1175,7 +1171,6 @@ class L13AdvancedRedrawSettings:
             "采样缓冲像素": 采样缓冲像素,
             "融合方式": 融合方式,
             "图像缩放算法": 图像缩放算法,
-            "分块顺序": 分块顺序,
             "最大分块数": 最大分块数,
         },)
 
@@ -2052,7 +2047,7 @@ class L13ContextMaskedRedraw8K:
                 "正向条件": ("CONDITIONING", {"tooltip": "第二段使用的正向提示词。可以和第一段相同，但建议 CFG 和降噪更低。"}),
                 "负向条件": ("CONDITIONING", {"tooltip": "第二段使用的负向提示词。节点不会改写提示词，建议手动加入 duplicate / collage 等负向词。"}),
                 "随机种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。每个 tile 从同一张噪声图裁切，避免 tile 独立随机。"}),
-                "步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "每个局部重绘 tile 的采样步数。人物图建议 10-20。"}),
+                "步数": ("INT", {"default": 8, "min": 1, "max": 10000, "tooltip": "每个局部重绘 tile 的采样步数。默认 8；想更细再提高。"}),
                 "CFG引导": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段；低 CFG 更依赖参考图，不容易重复主体。"}),
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "局部重绘使用的采样器。默认 euler，稳定且预览直观。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"default": "ddim_uniform", "tooltip": "局部重绘使用的调度器。默认 ddim_uniform，适合低 CFG 参考图重绘。"}),
@@ -2247,6 +2242,7 @@ class L13ContextMaskedRedraw8K:
         线稿模型补丁=None,
         线稿控制="禁用",
         线稿强度=0.35,
+        多轮强度递减=0.5,
     ):
         if isinstance(高级参数, dict):
             def setting(name, current):
@@ -2271,7 +2267,7 @@ class L13ContextMaskedRedraw8K:
             融合方式 = setting("融合方式", 融合方式)
             图像缩放算法 = setting("图像缩放算法", 图像缩放算法)
             重绘轮数 = setting("重绘轮数", 重绘轮数)
-            分块顺序 = setting("分块顺序", 分块顺序)
+            多轮强度递减 = setting("多轮强度递减", 多轮强度递减)
             最大分块数 = setting("最大分块数", 最大分块数)
             色彩稳定强度 = setting("色彩稳定强度", 色彩稳定强度)
             参考保留强度 = setting("参考保留强度", 参考保留强度)
@@ -2325,7 +2321,9 @@ class L13ContextMaskedRedraw8K:
             else:
                 raise RuntimeError("L13 参考重绘放大需要连接 参考图像；如果不接参考图像，则必须连接 输入latent 作为参考来源。")
 
+        分块顺序 = "蛇形"
         pass_count = max(1, int(重绘轮数))
+        round_decay = max(0.0, min(1.0, float(多轮强度递减)))
         safety_enabled = _enabled(人物安全模式)
         seam_enabled = _enabled(接缝修复)
         (
@@ -2436,6 +2434,7 @@ class L13ContextMaskedRedraw8K:
             stage_regions = _prepare_stage_regions(区域提示词, width, height, scale, canvas.device, canvas.dtype)
 
             for pass_index in range(pass_count):
+                pass_denoise = max(0.01, min(1.0, stage_denoise * (round_decay ** pass_index)))
                 accum = torch.zeros_like(canvas)
                 weights = torch.zeros((canvas.shape[0], 1, height, width), device=canvas.device, dtype=canvas.dtype)
 
@@ -2462,7 +2461,7 @@ class L13ContextMaskedRedraw8K:
                     context_noise = global_noise[:, :, cy0:cy1, cx0:cx1].clone()
                     noise_mask = torch.zeros((canvas.shape[0], 1, cy1 - cy0, cx1 - cx0), device=canvas.device, dtype=canvas.dtype)
                     noise_mask[:, :, sy0i:sy1i, sx0i:sx1i] = 1.0
-                    effective_denoise = stage_denoise
+                    effective_denoise = pass_denoise
 
                     if protect_mask is not None and not 高级采样器逻辑:
                         subject_ratio = float(protect_mask[:, :, y0:y1, x0:x1].mean().item())
@@ -2692,8 +2691,8 @@ class L13ContextMaskedRedraw8K:
             _param(kwargs, "采样缓冲像素", default=64),
             _param(kwargs, "融合方式", "blend", default="余弦"),
             _param(kwargs, "图像缩放算法", "image_upscale", default="lanczos"),
-            _param(kwargs, "重绘轮数", default=1),
-            _param(kwargs, "分块顺序", default="顺序"),
+            _param(kwargs, "重绘轮数", default=2),
+            "蛇形",
             _param(kwargs, "最大分块数", "max_tiles", default=4096),
             _param(kwargs, "色彩稳定强度", default=0.0),
             _param(kwargs, "参考保留强度", default=0.03),
@@ -2708,6 +2707,7 @@ class L13ContextMaskedRedraw8K:
             主体保护遮罩=_param(kwargs, "主体保护遮罩", default=None),
             主体保护强度=_param(kwargs, "主体保护强度", default=0.55),
             参考噪声强度=_param(kwargs, "参考噪声强度", default=0.0),
+            多轮强度递减=_param(kwargs, "多轮强度递减", default=0.5),
         )
 
 
@@ -2724,7 +2724,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
                 "VAE": ("VAE", {"tooltip": "用于把参考图像编码成高分辨率 latent，以及 8K tiled VAE encode/decode。"}),
                 "加噪": (cls.add_noise_modes, {"tooltip": "是否在本段开始时加入噪声。第一段通常启用；承接上一段剩余噪声时通常禁用。"}),
                 "噪声种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "生成整张高分辨率统一噪声场的种子。分段采样时各段必须保持一致。"}),
-                "步数": ("INT", {"default": 10, "min": 1, "max": 10000, "tooltip": "完整采样时间线的步数。高级分段时每一段都填同一个步数。"}),
+                "步数": ("INT", {"default": 8, "min": 1, "max": 10000, "tooltip": "完整采样时间线的步数。高级分段时每一段都填同一个步数。"}),
                 "CFG引导": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01, "tooltip": "第二段提示词引导强度。人物图建议低于第一段；低 CFG 更依赖参考图，不容易重复主体。"}),
                 "采样器": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "局部重绘使用的采样器。分段采样时各段应保持一致。"}),
                 "调度器": (comfy.samplers.KSampler.SCHEDULERS, {"default": "ddim_uniform", "tooltip": "局部重绘使用的调度器。分段采样时各段应保持一致。"}),
@@ -2779,7 +2779,7 @@ class L13ContextMaskedRedrawAdvanced8K(L13ContextMaskedRedraw8K):
             _param(kwargs, "融合方式", "blend", default="余弦"),
             _param(kwargs, "图像缩放算法", "image_upscale", default="lanczos"),
             _param(kwargs, "重绘轮数", default=1),
-            _param(kwargs, "分块顺序", default="顺序"),
+            "蛇形",
             _param(kwargs, "最大分块数", "max_tiles", default=4096),
             _param(kwargs, "色彩稳定强度", default=0.0),
             _param(kwargs, "参考保留强度", default=0.03),

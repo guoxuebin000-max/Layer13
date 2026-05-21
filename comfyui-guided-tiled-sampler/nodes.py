@@ -949,17 +949,6 @@ def _make_detail_residual_latent(canvas: torch.Tensor, base: torch.Tensor, kerne
         return torch.zeros_like(canvas)
 
 
-def _enhance_latent_detail_frequency(canvas: torch.Tensor, base: torch.Tensor, strength: float, kernel_size: int) -> torch.Tensor:
-    strength = max(0.0, min(0.35, float(strength)))
-    if strength <= 0.0:
-        return canvas
-    try:
-        detail_residual = _make_detail_residual_latent(canvas, base, kernel_size)
-        return (canvas + detail_residual * strength).to(device=canvas.device, dtype=canvas.dtype)
-    except Exception:
-        return canvas
-
-
 def _mask_to_output(mask: Optional[torch.Tensor], batch: int, height: int, width: int, mode: str, scale: int, device, dtype) -> torch.Tensor:
     if mask is None:
         out = torch.zeros((batch, 1, height, width), device=device, dtype=dtype)
@@ -2660,17 +2649,10 @@ class L13ContextMaskedRedraw8K:
             if stage_index < stage_count - 1:
                 current_pixels = _sharpen_pixels(_vae_decode_latent(VAE, canvas), 0.08, 3)
 
-        reference_canvas = base if base is not None else torch.zeros_like(canvas)
-        detail_boost = 0.0
-        if _uses_detail_noise(细节扰动, 细节噪声模式):
-            detail_boost = max(0.04, min(0.18, float(细节扰动) * 12.0))
-        detail_kernel = max(3, min(31, int(round(96 / max(1, scale)))))
-        if detail_kernel % 2 == 0:
-            detail_kernel = max(3, detail_kernel - 1)
-        canvas = _enhance_latent_detail_frequency(canvas, reference_canvas, detail_boost, detail_kernel)
-
         image = _vae_decode_latent(VAE, canvas)
+        image = _match_image_color(image, reference_pixels, 1.0, "低频颜色迁移")
         final_latent = {"samples": canvas}
+        reference_canvas = base if base is not None else torch.zeros_like(canvas)
         reference_latent = {"samples": reference_canvas}
         detail_residual = _make_detail_residual_latent(canvas, reference_latent["samples"], int(细节差异尺度))
         detail_latent = {"samples": detail_residual}

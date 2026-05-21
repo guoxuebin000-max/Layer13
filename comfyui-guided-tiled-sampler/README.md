@@ -73,7 +73,7 @@ Preview is handled by ComfyUI's built-in sampler preview system. There is no nod
 
 The normal `L13 参考重绘放大` node keeps `降噪` visible because it is the same denoise concept as KSampler img2img. Size/tile/detail controls are removed from the main node UI and use built-in defaults unless you connect `L13 参考重绘放大参数` to the `高级参数` input. Connected `高级参数` overrides custom width/height, tile size, overlap, context, detail perturbation, sample halo, blend mode, reference retention, subject denoise cap, background multiplier, seam repair settings, detail residual scale, and output mask size.
 
-The `图像` output is decoded inside the node with tiled VAE decode. It no longer receives fixed-strength low-frequency color transfer, because that can flatten sampled texture.
+The `图像` output is decoded inside the node with tiled VAE decode and then color-matched against the reference image with low-frequency color transfer at strength 1.0.
 
 The normal and advanced redraw nodes now also expose internal self-use debug outputs after the first `图像` output:
 
@@ -107,7 +107,7 @@ For automatic regional prompts, use `L13 视觉区域规划提示词` with any v
 
 `色彩稳定强度` is now a compatibility-only control for old workflows. It no longer matches latent mean/contrast because that can wash out some models. `参考保留强度` blends only low-frequency reference structure back into the sampled tile; this keeps composition anchoring without erasing newly generated texture.
 
-The redraw nodes no longer apply fixed-strength low-frequency color transfer on the final `图像` output. Final decoding now preserves the sampled latent and lightly boosts the sampled high-frequency residual when `细节扰动` is enabled, so texture is less likely to be flattened. `L13 图像颜色匹配` remains available as a standalone utility when a separate pixel-space color transfer is actually needed.
+The redraw nodes apply the same low-frequency color transfer on their final `图像` output. `L13 图像颜色匹配` remains available as a standalone utility when you want to compare or override the internal matched image.
 
 ## L13 Advanced Context Redraw
 

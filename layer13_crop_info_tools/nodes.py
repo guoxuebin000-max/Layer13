@@ -72,6 +72,58 @@ def _fit_box_to_aspect(cx: float, cy: float, width: float, height: float, aspect
     return cx, cy, width, height
 
 
+def _limit_box_size_to_image(
+    width: float,
+    height: float,
+    aspect,
+    img_w: int,
+    img_h: int,
+    min_w: int,
+    min_h: int,
+):
+    if aspect is None:
+        if width > img_w and img_w >= min_w:
+            width = float(img_w)
+        if height > img_h and img_h >= min_h:
+            height = float(img_h)
+        return width, height
+
+    image_aspect = float(img_w) / max(float(img_h), 1e-6)
+    if image_aspect >= aspect:
+        max_h = float(img_h)
+        max_w = max_h * aspect
+    else:
+        max_w = float(img_w)
+        max_h = max_w / aspect
+
+    if max_w >= min_w and max_h >= min_h and (width > max_w or height > max_h):
+        return max_w, max_h
+    return width, height
+
+
+def _shift_box_inside_image(x0: int, y0: int, x1: int, y1: int, img_w: int, img_h: int):
+    width = max(1, int(x1 - x0))
+    height = max(1, int(y1 - y0))
+
+    if width <= img_w:
+        if x0 < 0:
+            x1 -= x0
+            x0 = 0
+        if x1 > img_w:
+            x0 -= x1 - img_w
+            x1 = img_w
+
+    if height <= img_h:
+        if y0 < 0:
+            y1 -= y0
+            y0 = 0
+        if y1 > img_h:
+            y0 -= y1 - img_h
+            y1 = img_h
+
+    return int(x0), int(y0), int(x1), int(y1)
+
+
 def _clamp_crop(x0: float, y0: float, crop_w: float, crop_h: float, img_w: int, img_h: int):
     crop_w = min(max(crop_w, 1.0), float(img_w))
     crop_h = min(max(crop_h, 1.0), float(img_h))
@@ -398,18 +450,10 @@ def _resize_image_and_mask(
 
 def _crop_image_with_black(image: torch.Tensor, x0: int, y0: int, x1: int, y1: int) -> torch.Tensor:
     image = _ensure_image_batch(image)
-    batch, img_h, img_w, channels = image.shape
-    crop_w = max(1, int(x1 - x0))
-    crop_h = max(1, int(y1 - y0))
-    out = torch.zeros((batch, crop_h, crop_w, channels), device=image.device, dtype=image.dtype)
-
-    intersection = _box_intersection(x0, y0, x1, y1, img_w, img_h)
-    if intersection is None:
-        return out
-
-    src_x0, src_y0, src_x1, src_y1, dst_x0, dst_y0, dst_x1, dst_y1 = intersection
-    out[:, dst_y0:dst_y1, dst_x0:dst_x1, :] = image[:, src_y0:src_y1, src_x0:src_x1, :]
-    return out
+    _, img_h, img_w, _ = image.shape
+    ys = torch.arange(int(y0), int(y1), device=image.device).clamp(0, img_h - 1).to(dtype=torch.long)
+    xs = torch.arange(int(x0), int(x1), device=image.device).clamp(0, img_w - 1).to(dtype=torch.long)
+    return image.index_select(1, ys).index_select(2, xs)
 
 
 def _crop_mask_with_black(mask: torch.Tensor, x0: int, y0: int, x1: int, y1: int) -> torch.Tensor:
@@ -889,8 +933,26 @@ class Layer13CropInfoFromMask:
         if aspect is not None:
             cx, cy, crop_w, crop_h = _fit_box_to_aspect(cx, cy, crop_w, crop_h, aspect)
 
+        crop_w, crop_h = _limit_box_size_to_image(
+            crop_w,
+            crop_h,
+            aspect,
+            img_w,
+            img_h,
+            bbox_w,
+            bbox_h,
+        )
+
         divisible_by = int(四舍五入到倍数)
         crop_x0, crop_y0, crop_x1, crop_y1 = _make_integer_crop_box(cx, cy, crop_w, crop_h, img_w, img_h, divisible_by)
+        crop_x0, crop_y0, crop_x1, crop_y1 = _shift_box_inside_image(
+            crop_x0,
+            crop_y0,
+            crop_x1,
+            crop_y1,
+            img_w,
+            img_h,
+        )
 
         cropped = _crop_image_with_black(image, crop_x0, crop_y0, crop_x1, crop_y1)
         cropped_mask = _crop_mask_with_black(mask[:1], crop_x0, crop_y0, crop_x1, crop_y1).clamp(0.0, 1.0)

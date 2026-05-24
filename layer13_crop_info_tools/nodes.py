@@ -777,7 +777,6 @@ class Layer13CropInfoFromMask:
                 "mask": ("MASK",),
                 "反转遮罩": ("BOOLEAN", {"default": False}),
                 "检测": (["mask_area", "min_bounding_rect", "max_inscribed_rect"], {"default": "mask_area"}),
-                "mask_threshold": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "左侧扩展比例": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 20.0, "step": 0.01}),
                 "右侧扩展比例": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 20.0, "step": 0.01}),
                 "上方扩展比例": ("FLOAT", {"default": 0.0, "min": -5.0, "max": 20.0, "step": 0.01}),
@@ -787,23 +786,17 @@ class Layer13CropInfoFromMask:
                     {"default": "keep"},
                 ),
                 "四舍五入到倍数": (["1", "2", "4", "8", "16", "32", "64", "128", "256", "512"], {"default": "1"}),
-                "裁剪后缩放": (["不缩放", "长边", "短边", "宽高"], {"default": "不缩放"}),
+                "裁剪后缩放": (["不缩放", "长边", "短边"], {"default": "不缩放"}),
                 "裁剪后长度": ("INT", {"default": 1024, "min": 1, "max": 100000000, "step": 1}),
-                "裁剪后宽度": ("INT", {"default": 1024, "min": 1, "max": 100000000, "step": 1}),
-                "裁剪后高度": ("INT", {"default": 1024, "min": 1, "max": 100000000, "step": 1}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", CROP_INFO_TYPE, "STRING", "INT", "INT", "INT", "INT", "MASK", BOX_TYPE, "IMAGE")
+    RETURN_TYPES = ("IMAGE", "IMAGE", CROP_INFO_TYPE, "STRING", "MASK", BOX_TYPE, "IMAGE")
     RETURN_NAMES = (
         "cropped_image",
         "original_image",
         "crop_info",
         "crop_json",
-        "crop_x",
-        "crop_y",
-        "crop_w",
-        "crop_h",
         "cropped_mask",
         "crop_box",
         "box_preview",
@@ -817,7 +810,6 @@ class Layer13CropInfoFromMask:
         mask,
         反转遮罩=False,
         检测="mask_area",
-        mask_threshold=0.05,
         左侧扩展比例=0.0,
         右侧扩展比例=0.0,
         上方扩展比例=0.0,
@@ -826,8 +818,6 @@ class Layer13CropInfoFromMask:
         四舍五入到倍数="1",
         裁剪后缩放="不缩放",
         裁剪后长度=1024,
-        裁剪后宽度=1024,
-        裁剪后高度=1024,
         **kwargs,
     ):
         image = _first_image(image)
@@ -846,6 +836,9 @@ class Layer13CropInfoFromMask:
             下方扩展比例 = kwargs.get("pad_bottom", 下方扩展比例)
             裁切比例 = kwargs.get("aspect_ratio", 裁切比例)
         四舍五入到倍数 = kwargs.get("divisible_by", 四舍五入到倍数)
+        mask_threshold = kwargs.get("mask_threshold", 0.05)
+        裁剪后宽度 = kwargs.get("裁剪后宽度", int(裁剪后长度))
+        裁剪后高度 = kwargs.get("裁剪后高度", int(裁剪后长度))
 
         _, img_h, img_w, _ = image.shape
         mask = _resize_mask_to(mask, img_h, img_w)
@@ -891,10 +884,6 @@ class Layer13CropInfoFromMask:
             image,
             crop_info,
             json.dumps(crop_info, ensure_ascii=False),
-            crop_x0,
-            crop_y0,
-            crop_x1 - crop_x0,
-            crop_y1 - crop_y0,
             cropped_mask,
             crop_box,
             box_preview,

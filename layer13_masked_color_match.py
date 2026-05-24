@@ -61,6 +61,35 @@ def _weighted_stats(image: torch.Tensor, mask: torch.Tensor, threshold: float, e
     return mean, std
 
 
+def _luma_coeffs(channels: int, device, dtype) -> torch.Tensor:
+    coeffs = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=dtype)[:channels]
+    return coeffs / coeffs.sum().clamp_min(1e-6)
+
+
+def _luma_stats(image: torch.Tensor, mask: torch.Tensor, threshold: float, eps: float):
+    channels = min(int(image.shape[-1]), 3)
+    coeffs = _luma_coeffs(channels, image.device, image.dtype).view(1, 1, channels)
+    luma = (image[..., :channels] * coeffs).sum(dim=-1, keepdim=True)
+    mean, std = _weighted_stats(luma, mask, threshold, eps)
+    return luma, mean, std
+
+
+def _match_luma_distribution(
+    matched: torch.Tensor,
+    reference: torch.Tensor,
+    target_mask: torch.Tensor,
+    ref_mask: torch.Tensor,
+    threshold: float,
+    eps: float,
+):
+    matched_luma, matched_mean, matched_std = _luma_stats(matched, target_mask, threshold, eps)
+    _, ref_mean, ref_std = _luma_stats(reference, ref_mask, threshold, eps)
+    corrected_luma = (matched_luma - matched_mean.view(1, 1, 1)) * (
+        ref_std / matched_std.clamp_min(eps)
+    ).view(1, 1, 1) + ref_mean.view(1, 1, 1)
+    return matched + (corrected_luma - matched_luma)
+
+
 class Layer13MaskedColorMatch:
     @classmethod
     def INPUT_TYPES(cls):
@@ -70,7 +99,7 @@ class Layer13MaskedColorMatch:
                 "参考图像": ("IMAGE",),
                 "遮罩": ("MASK",),
                 "匹配方式": (["均值+方差", "仅均值", "亮度比例"], {"default": "均值+方差"}),
-                "强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "羽化半径": ("INT", {"default": 8, "min": 0, "max": 256, "step": 1}),
                 "统计阈值": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "反相遮罩": ("BOOLEAN", {"default": False}),
@@ -119,7 +148,7 @@ class Layer13MaskedColorMatch:
             ref_mask = _resize_mask(ref_mask, int(reference.shape[1]), int(reference.shape[2]))
 
         blend_mask = _feather_mask(target_mask, int(羽化半径))
-        strength = float(max(0.0, min(1.0, 强度)))
+        strength = float(max(0.0, min(2.0, 强度)))
         threshold = float(max(0.0, min(1.0, 统计阈值)))
         eps = 1e-6
 
@@ -145,6 +174,14 @@ class Layer13MaskedColorMatch:
                 matched = (target_rgb - target_mean.view(1, 1, rgb_channels))
                 matched = matched * (ref_std / target_std.clamp_min(eps)).view(1, 1, rgb_channels)
                 matched = matched + ref_mean.view(1, 1, rgb_channels)
+                matched = _match_luma_distribution(
+                    matched,
+                    reference_rgb,
+                    target_mask[index],
+                    ref_mask[index],
+                    threshold,
+                    eps,
+                )
 
             matched = target_rgb + (matched - target_rgb) * strength
             mask_c = blend_mask[index].unsqueeze(-1)

@@ -476,6 +476,31 @@ def _weighted_mean_std(image: torch.Tensor, mask: torch.Tensor, eps: float = 1e-
     return mean, std
 
 
+def _luma_coeffs(channels: int, device, dtype) -> torch.Tensor:
+    coeffs = torch.tensor([0.2126, 0.7152, 0.0722], device=device, dtype=dtype)[:channels]
+    return coeffs / coeffs.sum().clamp_min(1e-6)
+
+
+def _match_luminance_to_reference(matched: torch.Tensor, reference: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    channels = min(int(matched.shape[-1]), int(reference.shape[-1]), 3)
+    if channels <= 0:
+        return matched
+
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(-1)
+    coeffs = _luma_coeffs(channels, matched.device, matched.dtype).view(1, 1, 1, channels)
+    matched_luma = (matched[..., :channels] * coeffs).sum(dim=-1, keepdim=True)
+    reference_luma = (reference[..., :channels].to(device=matched.device, dtype=matched.dtype) * coeffs).sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    matched_mean, matched_std = _weighted_mean_std(matched_luma, mask)
+    reference_mean, reference_std = _weighted_mean_std(reference_luma, mask)
+    corrected_luma = (matched_luma - matched_mean) * (reference_std / matched_std.clamp_min(1e-6)) + reference_mean
+    return matched + (corrected_luma - matched_luma)
+
+
 def _match_processed_to_reference(processed: torch.Tensor, reference: torch.Tensor, mask: torch.Tensor, strength: float) -> torch.Tensor:
     strength = float(max(0.0, min(2.0, strength)))
     if strength <= 0.0:
@@ -492,6 +517,7 @@ def _match_processed_to_reference(processed: torch.Tensor, reference: torch.Tens
     proc_mean, proc_std = _weighted_mean_std(processed_rgb, mask)
     ref_mean, ref_std = _weighted_mean_std(reference_rgb, mask)
     matched = (processed_rgb - proc_mean) * (ref_std / proc_std.clamp_min(1e-6)) + ref_mean
+    matched = _match_luminance_to_reference(matched, reference_rgb, mask)
     matched = processed_rgb + (matched - processed_rgb) * strength
 
     out = processed.clone()

@@ -72,58 +72,6 @@ def _fit_box_to_aspect(cx: float, cy: float, width: float, height: float, aspect
     return cx, cy, width, height
 
 
-def _limit_box_size_to_image(
-    width: float,
-    height: float,
-    aspect,
-    img_w: int,
-    img_h: int,
-    min_w: int,
-    min_h: int,
-):
-    if aspect is None:
-        if width > img_w and img_w >= min_w:
-            width = float(img_w)
-        if height > img_h and img_h >= min_h:
-            height = float(img_h)
-        return width, height
-
-    image_aspect = float(img_w) / max(float(img_h), 1e-6)
-    if image_aspect >= aspect:
-        max_h = float(img_h)
-        max_w = max_h * aspect
-    else:
-        max_w = float(img_w)
-        max_h = max_w / aspect
-
-    if max_w >= min_w and max_h >= min_h and (width > max_w or height > max_h):
-        return max_w, max_h
-    return width, height
-
-
-def _shift_box_inside_image(x0: int, y0: int, x1: int, y1: int, img_w: int, img_h: int):
-    width = max(1, int(x1 - x0))
-    height = max(1, int(y1 - y0))
-
-    if width <= img_w:
-        if x0 < 0:
-            x1 -= x0
-            x0 = 0
-        if x1 > img_w:
-            x0 -= x1 - img_w
-            x1 = img_w
-
-    if height <= img_h:
-        if y0 < 0:
-            y1 -= y0
-            y0 = 0
-        if y1 > img_h:
-            y0 -= y1 - img_h
-            y1 = img_h
-
-    return int(x0), int(y0), int(x1), int(y1)
-
-
 def _clamp_crop(x0: float, y0: float, crop_w: float, crop_h: float, img_w: int, img_h: int):
     crop_w = min(max(crop_w, 1.0), float(img_w))
     crop_h = min(max(crop_h, 1.0), float(img_h))
@@ -550,18 +498,15 @@ def _match_processed_to_reference(processed: torch.Tensor, reference: torch.Tens
     if strength <= 0.0:
         return processed
 
-    mask = mask.to(device=processed.device, dtype=processed.dtype).clamp(0.0, 1.0)
-    if mask.ndim == 3:
-        mask = mask.unsqueeze(-1)
-
     channels = min(int(processed.shape[-1]), int(reference.shape[-1]), 3)
     processed_rgb = processed[..., :channels]
     reference_rgb = reference[..., :channels].to(device=processed.device, dtype=processed.dtype)
 
-    proc_mean, proc_std = _weighted_mean_std(processed_rgb, mask)
-    ref_mean, ref_std = _weighted_mean_std(reference_rgb, mask)
+    proc_mean = processed_rgb.mean(dim=(1, 2), keepdim=True)
+    proc_std = processed_rgb.var(dim=(1, 2), keepdim=True, unbiased=False).add(1e-5).sqrt()
+    ref_mean = reference_rgb.mean(dim=(1, 2), keepdim=True)
+    ref_std = reference_rgb.var(dim=(1, 2), keepdim=True, unbiased=False).add(1e-5).sqrt()
     matched = (processed_rgb - proc_mean) * (ref_std / proc_std.clamp_min(1e-6)) + ref_mean
-    matched = _match_luminance_to_reference(matched, reference_rgb, mask)
     matched = processed_rgb + (matched - processed_rgb) * strength
 
     out = processed.clone()
@@ -933,26 +878,8 @@ class Layer13CropInfoFromMask:
         if aspect is not None:
             cx, cy, crop_w, crop_h = _fit_box_to_aspect(cx, cy, crop_w, crop_h, aspect)
 
-        crop_w, crop_h = _limit_box_size_to_image(
-            crop_w,
-            crop_h,
-            aspect,
-            img_w,
-            img_h,
-            bbox_w,
-            bbox_h,
-        )
-
         divisible_by = int(四舍五入到倍数)
         crop_x0, crop_y0, crop_x1, crop_y1 = _make_integer_crop_box(cx, cy, crop_w, crop_h, img_w, img_h, divisible_by)
-        crop_x0, crop_y0, crop_x1, crop_y1 = _shift_box_inside_image(
-            crop_x0,
-            crop_y0,
-            crop_x1,
-            crop_y1,
-            img_w,
-            img_h,
-        )
 
         cropped = _crop_image_with_black(image, crop_x0, crop_y0, crop_x1, crop_y1)
         cropped_mask = _crop_mask_with_black(mask[:1], crop_x0, crop_y0, crop_x1, crop_y1).clamp(0.0, 1.0)
